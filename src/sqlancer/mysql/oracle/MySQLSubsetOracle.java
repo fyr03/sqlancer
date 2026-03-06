@@ -21,6 +21,12 @@ import sqlancer.mysql.gen.MySQLTableGenerator;
 import sqlancer.mysql.MySQLVisitor;
 import sqlancer.mysql.ast.MySQLExpression;
 import sqlancer.mysql.gen.MySQLExpressionGenerator;
+// import sqlancer.mysql.gen.MySQLDeleteGenerator;
+import sqlancer.mysql.ast.MySQLColumnReference;
+import sqlancer.mysql.ast.MySQLJoin;
+import sqlancer.mysql.ast.MySQLSelect;
+import sqlancer.mysql.ast.MySQLTableReference;
+import java.util.ArrayList;
 
 /**
  * Subset Oracle — Method 1: Copy + Extra Inserts
@@ -89,14 +95,38 @@ public class MySQLSubsetOracle implements TestOracle<MySQLGlobalState> {
 
             // ── Step 2: Populate S1 with random data ──────────────────────
             log("\n[Step 2] Inserting random rows into S1...");
-            int nrS1Inserts = 10 + Randomly.smallNumber();
-            for (int i = 0; i < nrS1Inserts; i++) {
+            MySQLExpressionGenerator genS1 = new MySQLExpressionGenerator(state).setColumns(s1Table.getColumns());
+            int nrS1Ops = 10 + Randomly.smallNumber();
+            for (int i = 0; i < nrS1Ops; i++) {
                 try {
-                    SQLQueryAdapter ins = MySQLInsertGenerator.insertRow(state, s1Table);
-                    logSQL(ins.getQueryString());
-                    state.executeStatement(ins);
-                } catch (Exception e) {
-                    log("  ⚠ INSERT skipped: " + e.getMessage());
+                    SQLQueryAdapter op;
+                    double p = Randomly.getPercentage();
+                    if (p < 0.6) {
+                        // 60%: INSERT 随机数据
+                        op = MySQLInsertGenerator.insertRow(state, s1Table);
+                    } else if (p < 0.8) {
+                        // 20%: DELETE 部分行（直接构造，精确针对 s1）
+                        String deleteSql = "DELETE FROM " + s1Name + " WHERE "
+                                + MySQLVisitor.asString(genS1.generateExpression());
+                        ExpectedErrors delErrors = new ExpectedErrors();
+                        MySQLErrors.addExpressionErrors(delErrors);
+                        op = new SQLQueryAdapter(deleteSql, delErrors);
+                    } else {
+                        // 20%: UPDATE 部分行（直接构造，精确针对 s1）
+                        MySQLColumn targetCol = Randomly.fromList(s1Table.getColumns());
+                        String updateSql = "UPDATE " + s1Name
+                                + " SET `" + targetCol.getName() + "` = "
+                                + MySQLVisitor.asString(genS1.generateConstant())
+                                + " WHERE " + MySQLVisitor.asString(genS1.generateExpression());
+                        ExpectedErrors updErrors = new ExpectedErrors();
+                        MySQLErrors.addInsertUpdateErrors(updErrors);
+                        MySQLErrors.addExpressionErrors(updErrors);
+                        op = new SQLQueryAdapter(updateSql, updErrors);
+                    }
+                    logSQL(op.getQueryString());
+                    state.executeStatement(op);
+                } catch (Throwable e) {
+                    log("  ⚠ Operation skipped: " + e.getClass().getSimpleName() + ": " + e.getMessage());
                 }
             }
             log("  Inserting boundary/null noise rows into S1...");
@@ -281,26 +311,85 @@ public class MySQLSubsetOracle implements TestOracle<MySQLGlobalState> {
     }
 
     private void verifySelectSubset(String s1Name, String s2Name, MySQLTable s1Table) throws Exception {
-        int nrChecks = 1 + Randomly.smallNumber();
+        int nrChecks = 3 + Randomly.smallNumber();
         log("\n[Step 6] Random SELECT subset checks (" + nrChecks + " queries)...");
 
-        MySQLExpressionGenerator gen = new MySQLExpressionGenerator(state)
-                .setColumns(s1Table.getColumns());
+        // MySQLExpressionGenerator gen = new MySQLExpressionGenerator(state)
+        //         .setColumns(s1Table.getColumns());
         ExpectedErrors errors = new ExpectedErrors();
         MySQLErrors.addExpressionErrors(errors);
 
         for (int i = 0; i < nrChecks; i++) {
-            String whereStr;
-            try {
-                MySQLExpression whereExpr = gen.generateExpression();
-                whereStr = MySQLVisitor.asString(whereExpr);
-            } catch (Exception e) {
-                log("  ⚠ Could not generate WHERE expression — skipping");
-                continue;
+            // log("  [SELECT#" + (i + 1) + "] Starting iteration...");
+            // 获取可用的全局表（排除 s1 和 s2 自身）用于 JOIN
+            List<MySQLTable> globalTables = state.getSchema().getDatabaseTables().stream()
+                    .filter(t -> !t.getName().equalsIgnoreCase(s1Name)
+                            && !t.getName().equalsIgnoreCase(s2Name))
+                    .collect(Collectors.toList());
+
+            // 决定是否加入 JOIN，以及 JOIN 哪张全局表
+            MySQLTable joinTable = (!globalTables.isEmpty() && Randomly.getBoolean())
+                    ? Randomly.fromList(globalTables) : null;
+
+            // 表达式生成器：s1 的列 + 可能的 JOIN 表的列
+            List<MySQLColumn> allCols = new ArrayList<>(s1Table.getColumns());
+            if (joinTable != null) {
+                allCols.addAll(joinTable.getColumns());
+            }
+            MySQLExpressionGenerator selGen = new MySQLExpressionGenerator(state).setColumns(allCols);
+
+            // 构建 MySQLSelect 对象
+            MySQLSelect sel = new MySQLSelect();
+            sel.setSelectType(Randomly.fromOptions(MySQLSelect.SelectType.values()));
+
+            // fetch 列：只取 s1Table 的列（用 MySQLColumnReference 携带表信息，
+            // asString() 会输出 s1_sub_N.col，后续整体替换表名即可得到 q2）
+            List<MySQLExpression> fetchCols = s1Table.getColumns().stream()
+                    .map(c -> new MySQLColumnReference(c, null))
+                    .collect(Collectors.toList());
+            sel.setFetchColumns(fetchCols);
+
+            // FROM：s1Table（q2 由字符串替换得到）
+            sel.setFromList(List.of(new MySQLTableReference(s1Table)));
+
+            // 可选 WHERE
+            if (Randomly.getBoolean()) {
+                sel.setWhereClause(selGen.generateExpression());
             }
 
-            String q1 = "SELECT * FROM " + s1Name + " WHERE " + whereStr;
-            String q2 = "SELECT * FROM " + s2Name + " WHERE " + whereStr;
+            // 可选 GROUP BY + HAVING
+            if (Randomly.getBoolean()) {
+                List<MySQLExpression> groupByCols = s1Table.getColumns().stream()
+                        .map(c -> new MySQLColumnReference(c, null))
+                        .collect(Collectors.toList());
+                sel.setGroupByExpressions(groupByCols);
+                if (Randomly.getBoolean()) {
+                    sel.setHavingClause(selGen.generateExpression());
+                }
+            }
+
+            // 可选 JOIN：只允许 INNER JOIN 和 LEFT JOIN（s1/s2 始终作为左表）
+            // RIGHT JOIN 会破坏子集关系，故排除
+            if (joinTable != null) {
+                MySQLJoin.JoinType joinType = Randomly.fromOptions(
+                        MySQLJoin.JoinType.INNER, MySQLJoin.JoinType.LEFT);
+                MySQLExpression onClause = selGen.generateExpression();
+                MySQLJoin join = new MySQLJoin(joinTable, onClause, joinType);
+                sel.setJoinList(List.of(join));
+            }
+
+            // 不加 LIMIT / OFFSET：会截断结果集破坏子集关系
+
+            String q1, q2;
+            try {
+                q1 = MySQLVisitor.asString(sel);
+                // 把所有 s1Name 替换成 s2Name，得到等价的 S2 查询
+                // s1_sub_N 足够唯一，不会误替换 joinTable 的列名
+                q2 = q1.replace(s1Name, s2Name);
+            } catch (Throwable e) {
+                log("  ⚠ Could not generate SELECT — skipping: " + e.getClass().getSimpleName() + ": " + e.getMessage());
+                continue;
+            }
             logSQL(q1);
             logSQL(q2);
 
@@ -318,12 +407,11 @@ public class MySQLSubsetOracle implements TestOracle<MySQLGlobalState> {
             java.util.Set<String> missing = new java.util.LinkedHashSet<>(rows1);
             missing.removeAll(rows2);
 
-            String whereDisplay = whereStr.length() > 50
-                    ? whereStr.substring(0, 47) + "..." : whereStr;
+            String queryDisplay = q1.length() > 60 ? q1.substring(0, 57) + "..." : q1;
             boolean pass = missing.isEmpty();
-            log(String.format("  SELECT#%d WHERE (%s)  →  |S1|=%d  |S2|=%d  missing=%d   [%s]",
-                    i + 1, whereDisplay, rows1.size(), rows2.size(), missing.size(),
-                    pass ? "✓ PASS" : "✗ FAIL  ← BUG DETECTED"));
+            log(String.format("  SELECT#%d  →  |S1|=%d  |S2|=%d  missing=%d   [%s]%n    Q: %s",
+                    i + 1, rows1.size(), rows2.size(), missing.size(),
+                    pass ? "✓ PASS" : "✗ FAIL  ← BUG DETECTED", queryDisplay));
 
             if (!pass) {
                 lastQueryString = q1 + "\n" + q2;
@@ -421,8 +509,8 @@ public class MySQLSubsetOracle implements TestOracle<MySQLGlobalState> {
                 try {
                     logSQL(sb.toString());
                     state.executeStatement(new SQLQueryAdapter(sb.toString(), insertErrors));
-                } catch (Exception e) {
-                    log("  ⚠ Noise INSERT skipped: " + e.getMessage());
+                } catch (Throwable e) {
+                    log("  ⚠ Noise INSERT skipped: " + e.getClass().getSimpleName() + ": " + e.getMessage());
                 }
             }
         }
@@ -437,8 +525,8 @@ public class MySQLSubsetOracle implements TestOracle<MySQLGlobalState> {
         try {
             logSQL(nullRow.toString());
             state.executeStatement(new SQLQueryAdapter(nullRow.toString(), insertErrors));
-        } catch (Exception e) {
-            log("  ⚠ All-NULL row skipped: " + e.getMessage());
+        } catch (Throwable e) {
+            log("  ⚠ All-NULL row skipped: " + e.getClass().getSimpleName() + ": " + e.getMessage());
         }
     }
 
