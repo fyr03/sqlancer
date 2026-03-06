@@ -14,6 +14,7 @@ import sqlancer.mysql.oracle.MySQLDQEOracle;
 import sqlancer.mysql.oracle.MySQLDQPOracle;
 import sqlancer.mysql.oracle.MySQLFuzzer;
 import sqlancer.mysql.oracle.MySQLPivotedQuerySynthesisOracle;
+import sqlancer.mysql.oracle.MySQLSubsetOracle;
 
 public enum MySQLOracleFactory implements OracleFactory<MySQLGlobalState> {
 
@@ -81,6 +82,28 @@ public enum MySQLOracleFactory implements OracleFactory<MySQLGlobalState> {
         @Override
         public TestOracle<MySQLGlobalState> create(MySQLGlobalState globalState) throws SQLException {
             return new MySQLDQEOracle(globalState);
+        }
+    },
+
+    /**
+     * Subset Oracle — Method 1.
+     *
+     * <p>Builds S1 (random schema + data) and S2 (S1's data plus extra rows),
+     * then checks that aggregate functions (COUNT, MAX, MIN, EXISTS) satisfy
+     * their expected monotonicity / anti-monotonicity properties.
+     *
+     * <p>Enable with: {@code --oracle SUBSET}
+     */
+    SUBSET {
+        @Override
+        public TestOracle<MySQLGlobalState> create(MySQLGlobalState globalState) throws Exception {
+            return new MySQLSubsetOracle(globalState);
+        }
+
+        @Override
+        public boolean requiresAllTablesToContainRows() {
+            // The oracle manages its own tables; the global schema need not be non-empty.
+            return false;
         }
     };
 }
