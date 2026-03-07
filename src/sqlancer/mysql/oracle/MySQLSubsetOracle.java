@@ -321,104 +321,80 @@ public class MySQLSubsetOracle implements TestOracle<MySQLGlobalState> {
 
         for (int i = 0; i < nrChecks; i++) {
             // log("  [SELECT#" + (i + 1) + "] Starting iteration...");
-            // 获取可用的全局表（排除 s1 和 s2 自身）用于 JOIN
-            List<MySQLTable> globalTables = state.getSchema().getDatabaseTables().stream()
-                    .filter(t -> !t.getName().equalsIgnoreCase(s1Name)
-                            && !t.getName().equalsIgnoreCase(s2Name))
-                    .collect(Collectors.toList());
+            try {
+                List<MySQLTable> globalTables = state.getSchema().getDatabaseTables().stream()
+                        .filter(t -> !t.getName().equalsIgnoreCase(s1Name)
+                                && !t.getName().equalsIgnoreCase(s2Name))
+                        .collect(Collectors.toList());
 
-            // 决定是否加入 JOIN，以及 JOIN 哪张全局表
-            MySQLTable joinTable = (!globalTables.isEmpty() && Randomly.getBoolean())
-                    ? Randomly.fromList(globalTables) : null;
+                MySQLTable joinTable = (!globalTables.isEmpty() && Randomly.getBoolean())
+                        ? Randomly.fromList(globalTables) : null;
 
-            // 表达式生成器：s1 的列 + 可能的 JOIN 表的列
-            List<MySQLColumn> allCols = new ArrayList<>(s1Table.getColumns());
-            if (joinTable != null) {
-                allCols.addAll(joinTable.getColumns());
-            }
-            MySQLExpressionGenerator selGen = new MySQLExpressionGenerator(state).setColumns(allCols);
+                List<MySQLColumn> allCols = new ArrayList<>(s1Table.getColumns());
+                if (joinTable != null) {
+                    allCols.addAll(joinTable.getColumns());
+                }
 
-            // 构建 MySQLSelect 对象
-            MySQLSelect sel = new MySQLSelect();
-            sel.setSelectType(Randomly.fromOptions(MySQLSelect.SelectType.values()));
+                MySQLExpressionGenerator selGen = new MySQLExpressionGenerator(state);
+                selGen.setTablesAndColumns(new sqlancer.mysql.MySQLSchema.MySQLTables(
+                        joinTable != null ? List.of(s1Table, joinTable) : List.of(s1Table)));
 
-            // fetch 列：只取 s1Table 的列（用 MySQLColumnReference 携带表信息，
-            // asString() 会输出 s1_sub_N.col，后续整体替换表名即可得到 q2）
-            List<MySQLExpression> fetchCols = s1Table.getColumns().stream()
-                    .map(c -> new MySQLColumnReference(c, null))
-                    .collect(Collectors.toList());
-            sel.setFetchColumns(fetchCols);
-
-            // FROM：s1Table（q2 由字符串替换得到）
-            sel.setFromList(List.of(new MySQLTableReference(s1Table)));
-
-            // 可选 WHERE
-            if (Randomly.getBoolean()) {
-                sel.setWhereClause(selGen.generateExpression());
-            }
-
-            // 可选 GROUP BY + HAVING
-            if (Randomly.getBoolean()) {
-                List<MySQLExpression> groupByCols = s1Table.getColumns().stream()
+                MySQLSelect sel = new MySQLSelect();
+                sel.setSelectType(Randomly.fromOptions(MySQLSelect.SelectType.values()));
+                List<MySQLExpression> fetchCols = s1Table.getColumns().stream()
                         .map(c -> new MySQLColumnReference(c, null))
                         .collect(Collectors.toList());
-                sel.setGroupByExpressions(groupByCols);
+                sel.setFetchColumns(fetchCols);
+                sel.setFromList(List.of(new MySQLTableReference(s1Table)));
                 if (Randomly.getBoolean()) {
-                    sel.setHavingClause(selGen.generateExpression());
+                    sel.setWhereClause(selGen.generateExpression());
                 }
-            }
+                if (Randomly.getBoolean()) {
+                    List<MySQLExpression> groupByCols = s1Table.getColumns().stream()
+                            .map(c -> new MySQLColumnReference(c, null))
+                            .collect(Collectors.toList());
+                    sel.setGroupByExpressions(groupByCols);
+                    if (Randomly.getBoolean()) {
+                        sel.setHavingClause(selGen.generateExpression());
+                    }
+                }
+                if (joinTable != null) {
+                    MySQLJoin.JoinType joinType = Randomly.fromOptions(
+                            MySQLJoin.JoinType.INNER, MySQLJoin.JoinType.LEFT);
+                    MySQLExpression onClause = selGen.generateExpression();
+                    MySQLJoin join = new MySQLJoin(joinTable, onClause, joinType);
+                    sel.setJoinList(List.of(join));
+                }
 
-            // 可选 JOIN：只允许 INNER JOIN 和 LEFT JOIN（s1/s2 始终作为左表）
-            // RIGHT JOIN 会破坏子集关系，故排除
-            if (joinTable != null) {
-                MySQLJoin.JoinType joinType = Randomly.fromOptions(
-                        MySQLJoin.JoinType.INNER, MySQLJoin.JoinType.LEFT);
-                MySQLExpression onClause = selGen.generateExpression();
-                MySQLJoin join = new MySQLJoin(joinTable, onClause, joinType);
-                sel.setJoinList(List.of(join));
-            }
+                String q1 = MySQLVisitor.asString(sel);
+                String q2 = q1.replace(s1Name, s2Name);
+                logSQL(q1);
+                logSQL(q2);
 
-            // 不加 LIMIT / OFFSET：会截断结果集破坏子集关系
+                java.util.Set<String> rows1, rows2;
+                rows1 = executeAndGetRowSet(q1, s1Table.getColumns().size());
+                rows2 = executeAndGetRowSet(q2, s1Table.getColumns().size());
 
-            String q1, q2;
-            try {
-                q1 = MySQLVisitor.asString(sel);
-                // 把所有 s1Name 替换成 s2Name，得到等价的 S2 查询
-                // s1_sub_N 足够唯一，不会误替换 joinTable 的列名
-                q2 = q1.replace(s1Name, s2Name);
+                java.util.Set<String> missing = new java.util.LinkedHashSet<>(rows1);
+                missing.removeAll(rows2);
+
+                String queryDisplay = q1.length() > 60 ? q1.substring(0, 57) + "..." : q1;
+                boolean pass = missing.isEmpty();
+                log(String.format("  SELECT#%d  →  |S1|=%d  |S2|=%d  missing=%d   [%s]%n    Q: %s",
+                        i + 1, rows1.size(), rows2.size(), missing.size(),
+                        pass ? "✓ PASS" : "✗ FAIL  ← BUG DETECTED", queryDisplay));
+
+                if (!pass) {
+                    lastQueryString = q1 + "\n" + q2;
+                    throw new AssertionError(String.format(
+                            "SELECT subset violation: result(%s) ⊄ result(%s)\n"
+                            + "  Missing rows: %s\n  Q1: %s\n  Q2: %s",
+                            s1Name, s2Name, missing, q1, q2));
+                }
+
             } catch (Throwable e) {
-                log("  ⚠ Could not generate SELECT — skipping: " + e.getClass().getSimpleName() + ": " + e.getMessage());
-                continue;
-            }
-            logSQL(q1);
-            logSQL(q2);
-
-            java.util.Set<String> rows1, rows2;
-            try {
-                int colCount = s1Table.getColumns().size();
-                rows1 = executeAndGetRowSet(q1, colCount);
-                rows2 = executeAndGetRowSet(q2, colCount);
-            } catch (Exception e) {
-                log("  ⚠ Query failed (" + e.getMessage() + ") — skipping this check");
-                continue;
-            }
-
-            // 检查 rows1 ⊆ rows2
-            java.util.Set<String> missing = new java.util.LinkedHashSet<>(rows1);
-            missing.removeAll(rows2);
-
-            String queryDisplay = q1.length() > 60 ? q1.substring(0, 57) + "..." : q1;
-            boolean pass = missing.isEmpty();
-            log(String.format("  SELECT#%d  →  |S1|=%d  |S2|=%d  missing=%d   [%s]%n    Q: %s",
-                    i + 1, rows1.size(), rows2.size(), missing.size(),
-                    pass ? "✓ PASS" : "✗ FAIL  ← BUG DETECTED", queryDisplay));
-
-            if (!pass) {
-                lastQueryString = q1 + "\n" + q2;
-                throw new AssertionError(String.format(
-                        "SELECT subset violation: result(%s WHERE ...) ⊄ result(%s WHERE ...)\n"
-                        + "  Missing rows: %s\n  Q1: %s\n  Q2: %s",
-                        s1Name, s2Name, missing, q1, q2));
+                log("  ⚠ SELECT#" + (i + 1) + " skipped: "
+                        + e.getClass().getSimpleName() + ": " + e.getMessage());
             }
         }
     }
