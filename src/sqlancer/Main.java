@@ -20,6 +20,8 @@ import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.LinkedBlockingQueue;
 
 import com.beust.jcommander.JCommander;
 import com.beust.jcommander.JCommander.Builder;
@@ -625,7 +627,15 @@ public final class Main {
             }
         }
 
-        ExecutorService execService = Executors.newFixedThreadPool(options.getNumberConcurrentThreads());
+        // ExecutorService execService = Executors.newFixedThreadPool(options.getNumberConcurrentThreads());
+        int nThreads = options.getNumberConcurrentThreads();
+        ExecutorService execService = new ThreadPoolExecutor(
+            nThreads,
+            nThreads,
+            0L, TimeUnit.MILLISECONDS,
+            new LinkedBlockingQueue<>(nThreads * 2),          // 有界队列，最多积压 nThreads*2 个任务
+            new ThreadPoolExecutor.CallerRunsPolicy()          // 队列满时主线程自己跑，自动阻塞
+        );
         DBMSExecutorFactory<?, ?, ?> executorFactory = nameToProvider.get(jc.getParsedCommand());
 
         if (options.performConnectionTest()) {

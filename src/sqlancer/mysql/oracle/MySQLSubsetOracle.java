@@ -55,6 +55,19 @@ public class MySQLSubsetOracle implements TestOracle<MySQLGlobalState> {
         this.insertErrors = new ExpectedErrors();
         MySQLErrors.addInsertUpdateErrors(insertErrors);
         MySQLErrors.addExpressionErrors(insertErrors);
+        // // 字符串插入数值列
+        // insertErrors.add("Incorrect string value");
+        // insertErrors.add("Incorrect double value");
+        // insertErrors.add("Incorrect integer value");
+        // insertErrors.add("Incorrect decimal value");
+        // // 多字节字符集问题
+        // insertErrors.add("Incorrect string value");
+        // insertErrors.add("Invalid utf8");
+        // insertErrors.add("Cannot convert");
+        // insertErrors.add("is not valid for CHARACTER SET");
+        // // REPLACE 特有
+        // insertErrors.add("doesn't have this option");
+        // insertErrors.add("DELAYED option");
     }
 
     // =========================================================================
@@ -96,7 +109,7 @@ public class MySQLSubsetOracle implements TestOracle<MySQLGlobalState> {
             // ── Step 2: Populate S1 with random data ──────────────────────
             log("\n[Step 2] Inserting random rows into S1...");
             MySQLExpressionGenerator genS1 = new MySQLExpressionGenerator(state).setColumns(s1Table.getColumns());
-            int nrS1Ops = 10 + Randomly.smallNumber();
+            int nrS1Ops = 50 + Randomly.smallNumber();
             for (int i = 0; i < nrS1Ops; i++) {
                 try {
                     SQLQueryAdapter op;
@@ -163,12 +176,26 @@ public class MySQLSubsetOracle implements TestOracle<MySQLGlobalState> {
 
             // ── Step 4: Insert extra random rows into S2 only ─────────────
             log("\n[Step 4] Inserting extra rows into S2 only (S1 unchanged)...");
-            int nrS2Extra = 1 + Randomly.smallNumber();
+            int nrS2Extra = 25 + Randomly.smallNumber();
             for (int i = 0; i < nrS2Extra; i++) {
                 try {
-                    SQLQueryAdapter ins = MySQLInsertGenerator.insertRow(state, s2Table);
-                    logSQL(ins.getQueryString());
-                    state.executeStatement(ins);
+                    // 直接构造 INSERT，不能用 InsertGenerator，它会随机生成 REPLACE
+                    List<MySQLColumn> cols = s2Table.getColumns();
+                    MySQLExpressionGenerator gen = new MySQLExpressionGenerator(state)
+                            .setColumns(cols);
+                    StringBuilder sb = new StringBuilder("INSERT IGNORE INTO ");
+                    sb.append(s2Name).append(" (");
+                    sb.append(cols.stream().map(c -> "`" + c.getName() + "`")
+                            .collect(Collectors.joining(", ")));
+                    sb.append(") VALUES (");
+                    sb.append(cols.stream()
+                            .map(c -> MySQLVisitor.asString(gen.generateConstant()))
+                            .collect(Collectors.joining(", ")));
+                    sb.append(")");
+                    ExpectedErrors insErrors = new ExpectedErrors();
+                    MySQLErrors.addInsertUpdateErrors(insErrors);
+                    MySQLErrors.addExpressionErrors(insErrors);
+                    state.executeStatement(new SQLQueryAdapter(sb.toString(), insErrors));
                 } catch (Exception e) {
                     log("  ⚠ INSERT skipped: " + e.getMessage());
                 }
@@ -311,7 +338,7 @@ public class MySQLSubsetOracle implements TestOracle<MySQLGlobalState> {
     }
 
     private void verifySelectSubset(String s1Name, String s2Name, MySQLTable s1Table) throws Exception {
-        int nrChecks = 3 + Randomly.smallNumber();
+        int nrChecks = 5 + Randomly.smallNumber();
         log("\n[Step 6] Random SELECT subset checks (" + nrChecks + " queries)...");
 
         // MySQLExpressionGenerator gen = new MySQLExpressionGenerator(state)
@@ -367,14 +394,22 @@ public class MySQLSubsetOracle implements TestOracle<MySQLGlobalState> {
                 }
 
                 String q1 = MySQLVisitor.asString(sel);
-                String q2 = q1.replace(s1Name, s2Name);
+                // String q2 = q1.replace(s1Name, s2Name);
+                String q2 = q1.replaceAll("\\b" + s1Name + "\\b", s2Name);
                 logSQL(q1);
                 logSQL(q2);
 
                 java.util.Set<String> rows1, rows2;
-                rows1 = executeAndGetRowSet(q1, s1Table.getColumns().size());
-                rows2 = executeAndGetRowSet(q2, s1Table.getColumns().size());
-
+                state.executeStatement(new SQLQueryAdapter(
+                    "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ", true));
+                state.executeStatement(new SQLQueryAdapter("START TRANSACTION", true));
+                try {
+                    rows1 = executeAndGetRowSet(q1, s1Table.getColumns().size());
+                    rows2 = executeAndGetRowSet(q2, s1Table.getColumns().size());
+                } finally {
+                    // 只读事务结束，回滚即可，不影响后续操作
+                    state.executeStatement(new SQLQueryAdapter("ROLLBACK", true));
+                }
                 java.util.Set<String> missing = new java.util.LinkedHashSet<>(rows1);
                 missing.removeAll(rows2);
 
@@ -391,7 +426,8 @@ public class MySQLSubsetOracle implements TestOracle<MySQLGlobalState> {
                             + "  Missing rows: %s\n  Q1: %s\n  Q2: %s",
                             s1Name, s2Name, missing, q1, q2));
                 }
-
+            } catch (AssertionError e) {
+                throw e;
             } catch (Throwable e) {
                 log("  ⚠ SELECT#" + (i + 1) + " skipped: "
                         + e.getClass().getSimpleName() + ": " + e.getMessage());

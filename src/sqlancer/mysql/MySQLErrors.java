@@ -55,6 +55,11 @@ public final class MySQLErrors {
         errors.add("Incorrect decimal value");
         errors.add("The value specified for generated column");
 
+        // errors.add("Incorrect string value");
+        // errors.add("Invalid utf8mb4 character string");
+        // errors.add("Cannot convert");
+        // errors.add("is not valid for CHARACTER SET");
+
         return errors;
     }
 
