@@ -55,10 +55,17 @@ public final class MySQLErrors {
         errors.add("Incorrect decimal value");
         errors.add("The value specified for generated column");
 
-        // errors.add("Incorrect string value");
-        // errors.add("Invalid utf8mb4 character string");
-        // errors.add("Cannot convert");
-        // errors.add("is not valid for CHARACTER SET");
+        errors.add("Incorrect string value");
+        errors.add("Invalid utf8mb4 character string");
+        errors.add("Cannot convert");
+        errors.add("is not valid for CHARACTER SET");
+        // 新增：文件系统不支持压缩
+        errors.add("Punch hole not supported");
+        errors.add("Compression failed");
+        // 新增：字符串插入数值列
+        errors.add("Incorrect DOUBLE value");
+        errors.add("Incorrect FLOAT value");
+        errors.add("Incorrect integer value");
 
         return errors;
     }

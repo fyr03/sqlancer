@@ -96,6 +96,8 @@ public class MySQLTableGenerator {
         list.add("Too many keys specified; max 1 keys allowed");
         list.add("The total length of the partitioning fields is too large");
         list.add("Got error -1 - 'Unknown error -1' from storage engine");
+        list.add("Compression failed");        // 新增
+        list.add("Punch hole not supported");  // 新增
     }
 
     private enum PartitionOptions {

@@ -15,6 +15,7 @@ import sqlancer.mysql.oracle.MySQLDQPOracle;
 import sqlancer.mysql.oracle.MySQLFuzzer;
 import sqlancer.mysql.oracle.MySQLPivotedQuerySynthesisOracle;
 import sqlancer.mysql.oracle.MySQLSubsetOracle;
+import sqlancer.mysql.oracle.MySQLSubsetOracle2;
 
 public enum MySQLOracleFactory implements OracleFactory<MySQLGlobalState> {
 
@@ -98,6 +99,19 @@ public enum MySQLOracleFactory implements OracleFactory<MySQLGlobalState> {
         @Override
         public TestOracle<MySQLGlobalState> create(MySQLGlobalState globalState) throws Exception {
             return new MySQLSubsetOracle(globalState);
+        }
+
+        @Override
+        public boolean requiresAllTablesToContainRows() {
+            // The oracle manages its own tables; the global schema need not be non-empty.
+            return false;
+        }
+    },
+    
+    SUBSET2 {
+        @Override
+        public TestOracle<MySQLGlobalState> create(MySQLGlobalState globalState) throws Exception {
+            return new MySQLSubsetOracle2(globalState);
         }
 
         @Override

@@ -29,15 +29,16 @@ import sqlancer.mysql.ast.MySQLTableReference;
 import java.util.ArrayList;
 
 /**
- * Subset Oracle — Method 1: Copy + Extra Inserts
+ * Subset Oracle — Method 2: Random Row Sampling
  *
- * <p>Constructs S1 ⊆ S2 and verifies aggregate monotonicity:
- * COUNT, MAX, MIN, EXISTS.
+ * <p>Constructs S2 ⊆ S1 by iterating over every row of S1 and inserting it
+ * into S2 with 50 % probability. Verifies aggregate monotonicity:
+ * COUNT, MAX, MIN, EXISTS (with S2 as the smaller set).
  *
  * <p>Verbose output is enabled by default. Disable via system property:
  * {@code -Dsqlancer.subset.verbose=false}
  */
-public class MySQLSubsetOracle implements TestOracle<MySQLGlobalState> {
+public class MySQLSubsetOracle2 implements TestOracle<MySQLGlobalState> {
 
     // ── Verbose flag ─────────────────────────────────────────────────────────
     // Control via:  -Dsqlancer.subset.verbose=false  to silence output
@@ -50,7 +51,7 @@ public class MySQLSubsetOracle implements TestOracle<MySQLGlobalState> {
     private final ExpectedErrors insertErrors;
     private String lastQueryString;
 
-    public MySQLSubsetOracle(MySQLGlobalState state) {
+    public MySQLSubsetOracle2(MySQLGlobalState state) {
         this.state = state;
         this.insertErrors = new ExpectedErrors();
         MySQLErrors.addInsertUpdateErrors(insertErrors);
@@ -77,11 +78,11 @@ public class MySQLSubsetOracle implements TestOracle<MySQLGlobalState> {
     @Override
     public void check() throws Exception {
         int id = TABLE_COUNTER.incrementAndGet();
-        String s1Name = "s1_sub_" + id;
-        String s2Name = "s2_sub_" + id;
+        String s1Name = "s1_sub2_" + id;
+        String s2Name = "s2_sub2_" + id;
 
         log("╔══════════════════════════════════════════════════════════════");
-        log("║  SUBSET ORACLE  round #" + id);
+        log("║  SUBSET ORACLE 2  round #" + id);
         log("╚══════════════════════════════════════════════════════════════");
 
         try {
@@ -116,7 +117,7 @@ public class MySQLSubsetOracle implements TestOracle<MySQLGlobalState> {
             // ── Step 2: Populate S1 with random data ──────────────────────
             log("\n[Step 2] Inserting random rows into S1...");
             MySQLExpressionGenerator genS1 = new MySQLExpressionGenerator(state).setColumns(s1Table.getColumns());
-            int nrS1Ops = 100 + Randomly.smallNumber();
+            int nrS1Ops = 200 + Randomly.smallNumber();
             for (int i = 0; i < nrS1Ops; i++) {
                 try {
                     SQLQueryAdapter op;
@@ -154,26 +155,69 @@ public class MySQLSubsetOracle implements TestOracle<MySQLGlobalState> {
             Long countS1 = executeSingleLong("SELECT COUNT(*) FROM " + s1Name);
             log("  ✓ S1 now has " + countS1 + " row(s) (random + boundary + null values)");
 
-            // ── Step 3: Create S2 (same schema) and copy S1 ──────────────
-            log("\n[Step 3] Creating S2 with same schema, then copying S1 → S2...");
+            // ── Step 3: Create S2 (same schema), then sample rows from S1 ─
+            log("\n[Step 3] Creating S2 with same schema, then sampling S1 → S2 (50% per row)...");
             String createS2Sql = "CREATE TABLE " + s2Name + " LIKE " + s1Name;
             logSQL(createS2Sql);
             state.executeStatement(new SQLQueryAdapter(createS2Sql, true));
 
-            String copySQL = "INSERT INTO " + s2Name + " SELECT * FROM " + s1Name;
-            logSQL(copySQL);
-            state.executeStatement(new SQLQueryAdapter(copySQL, insertErrors));
+            // Read every row from S1, insert into S2 with 50% probability
+            List<MySQLColumn> cols = s1Table.getColumns();
+            int numCols = cols.size();
+            String selectAllSql = "SELECT * FROM " + s1Name;
+            logSQL(selectAllSql);
 
-            Long countS2AfterCopy = executeSingleLong("SELECT COUNT(*) FROM " + s2Name);
-            log("  S1 rows: " + countS1 + "  →  S2 rows after copy: " + countS2AfterCopy);
+            SQLancerResultSet rsS1 = new SQLQueryAdapter(selectAllSql, new ExpectedErrors())
+                    .executeAndGet(state);
 
-            if (countS1 == null || countS2AfterCopy == null
-                    || !countS1.equals(countS2AfterCopy)) {
-                log("  ✗ Copy incomplete (e.g. UNIQUE constraint rejected rows) — skipping");
-                log("    This is NOT a bug; the subset invariant cannot be guaranteed here.");
-                throw new IgnoreMeException();
+            List<List<String>> sampledRows = new ArrayList<>();
+            if (rsS1 != null) {
+                try {
+                    while (rsS1.next()) {
+                        if (Randomly.getBoolean()) { // 50% probability
+                            List<String> row = new ArrayList<>();
+                            for (int i = 1; i <= numCols; i++) {
+                                row.add(rsS1.getString(i));
+                            }
+                            sampledRows.add(row);
+                        }
+                    }
+                } finally {
+                    rsS1.close();
+                }
             }
-            log("  ✓ All " + countS1 + " row(s) copied → S1 ⊆ S2 established");
+
+            // Insert sampled rows into S2
+            for (List<String> row : sampledRows) {
+                StringBuilder sb = new StringBuilder("INSERT IGNORE INTO ");
+                sb.append(s2Name).append(" (");
+                sb.append(cols.stream().map(c -> "`" + c.getName() + "`")
+                        .collect(Collectors.joining(", ")));
+                sb.append(") VALUES (");
+                for (int i = 0; i < row.size(); i++) {
+                    if (i > 0) sb.append(", ");
+                    String val = row.get(i);
+                    if (val == null) {
+                        sb.append("NULL");
+                    } else {
+                        // Escape single-quotes and backslashes for safe string literal
+                        sb.append("'")
+                          .append(val.replace("\\", "\\\\").replace("'", "\\'"))
+                          .append("'");
+                    }
+                }
+                sb.append(")");
+                try {
+                    logSQL(sb.toString());
+                    state.executeStatement(new SQLQueryAdapter(sb.toString(), insertErrors));
+                } catch (Throwable e) {
+                    log("  ⚠ Sampled INSERT skipped: " + e.getClass().getSimpleName() + ": " + e.getMessage());
+                }
+            }
+
+            Long countS2Final = executeSingleLong("SELECT COUNT(*) FROM " + s2Name);
+            log("  ✓ Final state → S1: " + countS1 + " rows  |  S2: " + countS2Final + " rows");
+            log("  Invariant established: " + s2Name + " ⊆ " + s1Name);
 
             state.updateSchema();
             MySQLTable s2Table = findTable(s2Name);
@@ -181,43 +225,15 @@ public class MySQLSubsetOracle implements TestOracle<MySQLGlobalState> {
                 throw new IgnoreMeException();
             }
 
-            // ── Step 4: Insert extra random rows into S2 only ─────────────
-            log("\n[Step 4] Inserting extra rows into S2 only (S1 unchanged)...");
-            int nrS2Extra = 25 + Randomly.smallNumber();
-            for (int i = 0; i < nrS2Extra; i++) {
-                try {
-                    // 直接构造 INSERT，不能用 InsertGenerator，它会随机生成 REPLACE
-                    List<MySQLColumn> cols = s2Table.getColumns();
-                    MySQLExpressionGenerator gen = new MySQLExpressionGenerator(state)
-                            .setColumns(cols);
-                    StringBuilder sb = new StringBuilder("INSERT IGNORE INTO ");
-                    sb.append(s2Name).append(" (");
-                    sb.append(cols.stream().map(c -> "`" + c.getName() + "`")
-                            .collect(Collectors.joining(", ")));
-                    sb.append(") VALUES (");
-                    sb.append(cols.stream()
-                            .map(c -> MySQLVisitor.asString(gen.generateConstant()))
-                            .collect(Collectors.joining(", ")));
-                    sb.append(")");
-                    ExpectedErrors insErrors = new ExpectedErrors();
-                    MySQLErrors.addInsertUpdateErrors(insErrors);
-                    MySQLErrors.addExpressionErrors(insErrors);
-                    state.executeStatement(new SQLQueryAdapter(sb.toString(), insErrors));
-                } catch (Exception e) {
-                    log("  ⚠ INSERT skipped: " + e.getMessage());
-                }
-            }
-            Long countS2Final = executeSingleLong("SELECT COUNT(*) FROM " + s2Name);
-            log("  ✓ Final state → S1: " + countS1 + " rows  |  S2: " + countS2Final + " rows");
-            log("  Invariant confirmed: " + s1Name + " ⊆ " + s2Name);
+            // ── Step 4: Verify aggregate monotonicity properties ──────────
+            // NOTE: S2 ⊆ S1, so arguments are swapped compared to Method 1:
+            //   the "subset" argument is s2, and the "superset" argument is s1.
+            log("\n[Step 4] Checking aggregate monotonicity (S2 ⊆ S1)...");
 
-            // ── Step 5: Verify aggregate monotonicity properties ──────────
-            log("\n[Step 5] Checking aggregate monotonicity...");
+            verifyCount(s2Name, s1Name, countS2Final, countS1, s2Table);
+            verifyExists(s2Name, s1Name, countS2Final, countS1);
 
-            verifyCount(s1Name, s2Name, countS1, countS2Final, s1Table);
-            verifyExists(s1Name, s2Name, countS1, countS2Final);
-
-            List<MySQLColumn> numericCols = s1Table.getColumns().stream()
+            List<MySQLColumn> numericCols = s2Table.getColumns().stream()
                     .filter(c -> c.getType().isNumeric())
                     .collect(Collectors.toList());
 
@@ -225,16 +241,16 @@ public class MySQLSubsetOracle implements TestOracle<MySQLGlobalState> {
                 log("  ℹ No numeric columns — MAX/MIN checks skipped");
             }
             for (MySQLColumn col : numericCols) {
-                verifyMax(s1Name, s2Name, col.getName(), s1Table);
-                verifyMin(s1Name, s2Name, col.getName(), s1Table);
+                verifyMax(s2Name, s1Name, col.getName(), s2Table);
+                verifyMin(s2Name, s1Name, col.getName(), s2Table);
             }
 
             for (MySQLColumn col : numericCols) {
-                verifyCountDistinct(s1Name, s2Name, col.getName());
+                verifyCountDistinct(s2Name, s1Name, col.getName());
             }
-            verifySelectSubset(s1Name, s2Name, s1Table);
-            verifyInSubquery(s1Name, s2Name, s1Table);
-            
+            verifySelectSubset(s2Name, s1Name, s2Table);
+            verifyInSubquery(s2Name, s1Name, s2Table);
+
             log("\n  ✓✓✓ All checks PASSED for round #" + id);
 
         } catch (java.sql.SQLNonTransientConnectionException e) {
@@ -260,10 +276,11 @@ public class MySQLSubsetOracle implements TestOracle<MySQLGlobalState> {
 
     // =========================================================================
     //  Property checkers
+    //  Convention: s1Name = the SUBSET, s2Name = the SUPERSET.
     // =========================================================================
 
     /**
-     * COUNT(*) monotonicity: COUNT(S1) ≤ COUNT(S2).
+     * COUNT(*) monotonicity: COUNT(subset) ≤ COUNT(superset).
      */
     private void verifyCount(String s1Name, String s2Name,
             Long knownC1, Long knownC2, MySQLTable s1Table) throws Exception {
@@ -304,7 +321,7 @@ public class MySQLSubsetOracle implements TestOracle<MySQLGlobalState> {
     }
 
     /**
-     * EXISTS monotonicity: EXISTS(S1) ⟹ EXISTS(S2).
+     * EXISTS monotonicity: EXISTS(subset) ⟹ EXISTS(superset).
      */
     private void verifyExists(String s1Name, String s2Name,
             Long knownC1, Long knownC2) throws Exception {
@@ -327,7 +344,7 @@ public class MySQLSubsetOracle implements TestOracle<MySQLGlobalState> {
     }
 
     /**
-     * MAX monotonicity: MAX(S1.col) ≤ MAX(S2.col).
+     * MAX monotonicity: MAX(subset.col) ≤ MAX(superset.col).
      */
     private void verifyMax(String s1Name, String s2Name, String col, MySQLTable s1Table) throws Exception {
         // 随机决定是否加 WHERE 条件
@@ -359,7 +376,7 @@ public class MySQLSubsetOracle implements TestOracle<MySQLGlobalState> {
     }
 
     /**
-     * MIN anti-monotonicity: MIN(S1.col) ≥ MIN(S2.col).
+     * MIN anti-monotonicity: MIN(subset.col) ≥ MIN(superset.col).
      */
     private void verifyMin(String s1Name, String s2Name, String col, MySQLTable s1Table) throws Exception {
         // 随机决定是否加 WHERE 条件
@@ -392,15 +409,12 @@ public class MySQLSubsetOracle implements TestOracle<MySQLGlobalState> {
 
     private void verifySelectSubset(String s1Name, String s2Name, MySQLTable s1Table) throws Exception {
         int nrChecks = 15 + Randomly.smallNumber();
-        log("\n[Step 6] Random SELECT subset checks (" + nrChecks + " queries)...");
+        log("\n[Step 5] Random SELECT subset checks (" + nrChecks + " queries)...");
 
-        // MySQLExpressionGenerator gen = new MySQLExpressionGenerator(state)
-        //         .setColumns(s1Table.getColumns());
         ExpectedErrors errors = new ExpectedErrors();
         MySQLErrors.addExpressionErrors(errors);
 
         for (int i = 0; i < nrChecks; i++) {
-            // log("  [SELECT#" + (i + 1) + "] Starting iteration...");
             try {
                 List<MySQLTable> globalTables = state.getSchema().getDatabaseTables().stream()
                         .filter(t -> !t.getName().equalsIgnoreCase(s1Name)
@@ -431,13 +445,16 @@ public class MySQLSubsetOracle implements TestOracle<MySQLGlobalState> {
                 }
                 // if (Randomly.getBoolean()) {
                 //     List<MySQLExpression> groupByCols = s1Table.getColumns().stream()
+                //             .filter(c -> {  // ← 只对非文本列做 GROUP BY
+                //                 String typeName = c.getType().name().toUpperCase();
+                //                 return !typeName.contains("TEXT") && !typeName.contains("BLOB")
+                //                     && !typeName.contains("CHAR") && !typeName.contains("BINARY");
+                //             })
                 //             .map(c -> new MySQLColumnReference(c, null))
                 //             .collect(Collectors.toList());
-                //     sel.setGroupByExpressions(groupByCols);
-                    // if (Randomly.getBoolean()) {
-                    //     sel.setHavingClause(selGen.generateExpression());
-                    // }
-                    // Having子句可能导致不单调
+                //     if (!groupByCols.isEmpty()) {
+                //         sel.setGroupByExpressions(groupByCols);
+                //     }
                 // }
                 if (joinTable != null) {
                     MySQLJoin.JoinType joinType = Randomly.fromOptions(
@@ -447,8 +464,8 @@ public class MySQLSubsetOracle implements TestOracle<MySQLGlobalState> {
                     sel.setJoinList(List.of(join));
                 }
 
+                // q1 is built on s1Table (the subset). Replace s1Name with s2Name to get q2 (superset).
                 String q1 = MySQLVisitor.asString(sel);
-                // String q2 = q1.replace(s1Name, s2Name);
                 String q2 = q1.replaceAll("\\b" + s1Name + "\\b", s2Name);
                 logSQL(q1);
                 logSQL(q2);

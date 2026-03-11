@@ -62,7 +62,8 @@ public class MySQLAlterTable {
 
     private SQLQueryAdapter create() {
         ExpectedErrors errors = ExpectedErrors.from("does not support the create option", "doesn't have this option",
-                "is not supported for this operation", "Data truncation", "Specified key was too long");
+                "is not supported for this operation", "Data truncation", "Specified key was too long",
+                    "Compression failed", "Punch hole not supported");
         errors.add("Data truncated for functional index ");
         sb.append("ALTER TABLE ");
         MySQLTable table = schema.getRandomTable();
