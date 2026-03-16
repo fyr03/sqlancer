@@ -161,58 +161,13 @@ public class MySQLSubsetOracle2 implements TestOracle<MySQLGlobalState> {
             logSQL(createS2Sql);
             state.executeStatement(new SQLQueryAdapter(createS2Sql, true));
 
-            // Read every row from S1, insert into S2 with 50% probability
-            List<MySQLColumn> cols = s1Table.getColumns();
-            int numCols = cols.size();
-            String selectAllSql = "SELECT * FROM " + s1Name;
-            logSQL(selectAllSql);
-
-            SQLancerResultSet rsS1 = new SQLQueryAdapter(selectAllSql, new ExpectedErrors())
-                    .executeAndGet(state);
-
-            List<List<String>> sampledRows = new ArrayList<>();
-            if (rsS1 != null) {
-                try {
-                    while (rsS1.next()) {
-                        if (Randomly.getBoolean()) { // 50% probability
-                            List<String> row = new ArrayList<>();
-                            for (int i = 1; i <= numCols; i++) {
-                                row.add(rsS1.getString(i));
-                            }
-                            sampledRows.add(row);
-                        }
-                    }
-                } finally {
-                    rsS1.close();
-                }
-            }
-
-            // Insert sampled rows into S2
-            for (List<String> row : sampledRows) {
-                StringBuilder sb = new StringBuilder("INSERT IGNORE INTO ");
-                sb.append(s2Name).append(" (");
-                sb.append(cols.stream().map(c -> "`" + c.getName() + "`")
-                        .collect(Collectors.joining(", ")));
-                sb.append(") VALUES (");
-                for (int i = 0; i < row.size(); i++) {
-                    if (i > 0) sb.append(", ");
-                    String val = row.get(i);
-                    if (val == null) {
-                        sb.append("NULL");
-                    } else {
-                        // Escape single-quotes and backslashes for safe string literal
-                        sb.append("'")
-                          .append(val.replace("\\", "\\\\").replace("'", "\\'"))
-                          .append("'");
-                    }
-                }
-                sb.append(")");
-                try {
-                    logSQL(sb.toString());
-                    state.executeStatement(new SQLQueryAdapter(sb.toString(), insertErrors));
-                } catch (Throwable e) {
-                    log("  ⚠ Sampled INSERT skipped: " + e.getClass().getSimpleName() + ": " + e.getMessage());
-                }
+            // SQL-level random sampling: ~50% of S1 rows via RAND()
+            String sampleSQL = "INSERT IGNORE INTO " + s2Name + " SELECT * FROM " + s1Name + " WHERE RAND() < 0.5";
+            logSQL(sampleSQL);
+            try {
+                state.executeStatement(new SQLQueryAdapter(sampleSQL, insertErrors));
+            } catch (Throwable e) {
+                log("  ⚠ Sampling INSERT skipped: " + e.getClass().getSimpleName() + ": " + e.getMessage());
             }
 
             Long countS2Final = executeSingleLong("SELECT COUNT(*) FROM " + s2Name);
@@ -470,18 +425,26 @@ public class MySQLSubsetOracle2 implements TestOracle<MySQLGlobalState> {
                 logSQL(q1);
                 logSQL(q2);
 
-                java.util.Set<String> rows1, rows2;
+                java.util.Set<String> rows1 = java.util.Collections.emptySet();
+                java.util.Set<String> rows2 = java.util.Collections.emptySet();
                 state.executeStatement(new SQLQueryAdapter(
                     "SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ", true));
-                state.executeStatement(new SQLQueryAdapter("ROLLBACK", true)); // 确保干净状态
+                state.executeStatement(new SQLQueryAdapter("ROLLBACK", true));
                 state.executeStatement(new SQLQueryAdapter("START TRANSACTION", true));
+                boolean queryFailed = false;
                 try {
                     rows1 = executeAndGetRowSet(q1, s1Table.getColumns().size());
                     rows2 = executeAndGetRowSet(q2, s1Table.getColumns().size());
+                } catch (SQLException e) {
+                    // Q1 或 Q2 执行失败（例如算术溢出 ERROR 1690）
+                    // 这不是 MySQL 的子集语义 bug，直接跳过本次检查
+                    log("  ⚠ SELECT#" + (i + 1) + " skipped (query execution error): "
+                            + e.getClass().getSimpleName() + ": " + e.getMessage());
+                    queryFailed = true;   // ← 标记失败
                 } finally {
-                    // 只读事务结束，回滚即可，不影响后续操作
                     state.executeStatement(new SQLQueryAdapter("ROLLBACK", true));
                 }
+                if (queryFailed) continue;   // ← 跳过后续比较，进入下一次循环
                 java.util.Set<String> missing = new java.util.LinkedHashSet<>(rows1);
                 missing.removeAll(rows2);
 
@@ -732,7 +695,12 @@ public class MySQLSubsetOracle2 implements TestOracle<MySQLGlobalState> {
         MySQLErrors.addExpressionErrors(errors);
         state.getState().logStatement(query);
         SQLancerResultSet rs = new SQLQueryAdapter(query, errors).executeAndGet(state);
-        if (rs == null) return rows;
+        if (rs == null) {
+            // null 意味着查询执行失败（如 ERROR 1690 算术溢出）
+            // 抛出异常而不是返回空集，让 verifySelectSubset 能区分
+            // "查询失败" 和 "查询成功但结果为空" 这两种情况
+            throw new SQLException("Query failed (null ResultSet): " + query);
+        }
         try {
             while (rs.next()) {
                 StringBuilder row = new StringBuilder();

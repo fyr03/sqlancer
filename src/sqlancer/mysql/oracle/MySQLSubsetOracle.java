@@ -94,12 +94,6 @@ public class MySQLSubsetOracle implements TestOracle<MySQLGlobalState> {
                 createS1 = MySQLTableGenerator.generate(state, s1Name);
             } while (createS1.getQueryString().toUpperCase().contains(" LIKE "));
             logSQL(createS1.getQueryString());
-
-            // boolean created = state.executeStatement(createS1);
-            // if (!created) {
-            //     log("  ✗ CREATE TABLE failed — skipping round");
-            //     throw new IgnoreMeException();
-            // }
             state.executeStatement(createS1);
             state.updateSchema();
 
@@ -117,6 +111,9 @@ public class MySQLSubsetOracle implements TestOracle<MySQLGlobalState> {
             log("\n[Step 2] Inserting random rows into S1...");
             MySQLExpressionGenerator genS1 = new MySQLExpressionGenerator(state).setColumns(s1Table.getColumns());
             int nrS1Ops = 100 + Randomly.smallNumber();
+
+            List<String> s1SqlLog = new ArrayList<>();  //记录所有对S1执行的SQL
+
             for (int i = 0; i < nrS1Ops; i++) {
                 try {
                     SQLQueryAdapter op;
@@ -143,6 +140,7 @@ public class MySQLSubsetOracle implements TestOracle<MySQLGlobalState> {
                         MySQLErrors.addExpressionErrors(updErrors);
                         op = new SQLQueryAdapter(updateSql, updErrors);
                     }
+                    s1SqlLog.add(op.getQueryString());  // 记录SQL（执行前记录，不管是否成功）
                     logSQL(op.getQueryString());
                     state.executeStatement(op);
                 } catch (Throwable e) {
@@ -150,22 +148,31 @@ public class MySQLSubsetOracle implements TestOracle<MySQLGlobalState> {
                 }
             }
             log("  Inserting boundary/null noise rows into S1...");
-            insertNoiseRows(s1Table);
+            insertNoiseRows(s1Table, s1SqlLog);  // 传入日志列表
             Long countS1 = executeSingleLong("SELECT COUNT(*) FROM " + s1Name);
             log("  ✓ S1 now has " + countS1 + " row(s) (random + boundary + null values)");
 
-            // ── Step 3: Create S2 (same schema) and copy S1 ──────────────
-            log("\n[Step 3] Creating S2 with same schema, then copying S1 → S2...");
+            // ── Step 3: Create S2 (same schema), then replay S1's SQL log ──
+            log("\n[Step 3] Creating S2 with same schema, then replaying S1 SQL log onto S2...");
             String createS2Sql = "CREATE TABLE " + s2Name + " LIKE " + s1Name;
             logSQL(createS2Sql);
             state.executeStatement(new SQLQueryAdapter(createS2Sql, true));
 
-            String copySQL = "INSERT INTO " + s2Name + " SELECT * FROM " + s1Name;
-            logSQL(copySQL);
-            state.executeStatement(new SQLQueryAdapter(copySQL, insertErrors));
+            // 把日志里每条SQL的 s1Name 替换为 s2Name，然后重新执行
+            log("  Replaying " + s1SqlLog.size() + " SQL statements onto S2...");
+            for (String sql : s1SqlLog) {
+                String replayedSql = sql.replaceAll(
+                        "(?i)\\b" + java.util.regex.Pattern.quote(s1Name) + "\\b", s2Name);
+                logSQL(replayedSql);
+                try {
+                    state.executeStatement(new SQLQueryAdapter(replayedSql, insertErrors));
+                } catch (Throwable e) {
+                    log("  ⚠ Replay skipped: " + e.getClass().getSimpleName() + ": " + e.getMessage());
+                }
+            }
 
             Long countS2AfterCopy = executeSingleLong("SELECT COUNT(*) FROM " + s2Name);
-            log("  S1 rows: " + countS1 + "  →  S2 rows after copy: " + countS2AfterCopy);
+            log("  S1 rows: " + countS1 + "  →  S2 rows after replay: " + countS2AfterCopy);
 
             if (countS1 == null || countS2AfterCopy == null
                     || !countS1.equals(countS2AfterCopy)) {
@@ -173,7 +180,7 @@ public class MySQLSubsetOracle implements TestOracle<MySQLGlobalState> {
                 log("    This is NOT a bug; the subset invariant cannot be guaranteed here.");
                 throw new IgnoreMeException();
             }
-            log("  ✓ All " + countS1 + " row(s) copied → S1 ⊆ S2 established");
+            log("  ✓ All " + countS1 + " row(s) replayed → S1 ⊆ S2 established");
 
             state.updateSchema();
             MySQLTable s2Table = findTable(s2Name);
@@ -234,7 +241,7 @@ public class MySQLSubsetOracle implements TestOracle<MySQLGlobalState> {
             }
             verifySelectSubset(s1Name, s2Name, s1Table);
             verifyInSubquery(s1Name, s2Name, s1Table);
-            
+
             log("\n  ✓✓✓ All checks PASSED for round #" + id);
 
         } catch (java.sql.SQLNonTransientConnectionException e) {
@@ -453,18 +460,26 @@ public class MySQLSubsetOracle implements TestOracle<MySQLGlobalState> {
                 logSQL(q1);
                 logSQL(q2);
 
-                java.util.Set<String> rows1, rows2;
+                java.util.Set<String> rows1 = java.util.Collections.emptySet();
+                java.util.Set<String> rows2 = java.util.Collections.emptySet();
                 state.executeStatement(new SQLQueryAdapter(
                     "SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ", true));
-                state.executeStatement(new SQLQueryAdapter("ROLLBACK", true)); // 确保干净状态
+                state.executeStatement(new SQLQueryAdapter("ROLLBACK", true));
                 state.executeStatement(new SQLQueryAdapter("START TRANSACTION", true));
+                boolean queryFailed = false;
                 try {
                     rows1 = executeAndGetRowSet(q1, s1Table.getColumns().size());
                     rows2 = executeAndGetRowSet(q2, s1Table.getColumns().size());
+                } catch (SQLException e) {
+                    // Q1 或 Q2 执行失败（例如算术溢出 ERROR 1690）
+                    // 这不是 MySQL 的子集语义 bug，直接跳过本次检查
+                    log("  ⚠ SELECT#" + (i + 1) + " skipped (query execution error): "
+                            + e.getClass().getSimpleName() + ": " + e.getMessage());
+                    queryFailed = true;   // ← 标记失败
                 } finally {
-                    // 只读事务结束，回滚即可，不影响后续操作
                     state.executeStatement(new SQLQueryAdapter("ROLLBACK", true));
                 }
+                if (queryFailed) continue;   // ← 跳过后续比较，进入下一次循环
                 java.util.Set<String> missing = new java.util.LinkedHashSet<>(rows1);
                 missing.removeAll(rows2);
 
@@ -538,13 +553,10 @@ public class MySQLSubsetOracle implements TestOracle<MySQLGlobalState> {
     }
 
     /**
-     * 向指定表插入噪音值，噪音值包括各类型的边界值和 NULL。
-     * 每次调用会尝试插入多行，每行对每一列独立选取一个噪音值。
-     * 因约束冲突（UNIQUE、NOT NULL 等）导致的失败直接忽略。
+     * 向指定表插入噪音值，同时将执行的 SQL 记录到 sqlLog。
      */
-    private void insertNoiseRows(MySQLTable table) {
+    private void insertNoiseRows(MySQLTable table, List<String> sqlLog) {
         List<MySQLColumn> cols = table.getColumns();
-        // 每列的边界值列表（字符串形式，直接拼入 SQL）
         java.util.Map<MySQLColumn, List<String>> boundaryMap = new java.util.LinkedHashMap<>();
         for (MySQLColumn col : cols) {
             List<String> vals = new java.util.ArrayList<>();
@@ -622,6 +634,7 @@ public class MySQLSubsetOracle implements TestOracle<MySQLGlobalState> {
                 }
                 sb.append(")");
                 try {
+                    sqlLog.add(sb.toString());  // 记录到日志
                     logSQL(sb.toString());
                     state.executeStatement(new SQLQueryAdapter(sb.toString(), insertErrors));
                 } catch (Throwable e) {
@@ -638,6 +651,7 @@ public class MySQLSubsetOracle implements TestOracle<MySQLGlobalState> {
         nullRow.append(cols.stream().map(c -> "NULL").collect(Collectors.joining(", ")));
         nullRow.append(")");
         try {
+            sqlLog.add(nullRow.toString());  // 记录到日志
             logSQL(nullRow.toString());
             state.executeStatement(new SQLQueryAdapter(nullRow.toString(), insertErrors));
         } catch (Throwable e) {
@@ -715,7 +729,12 @@ public class MySQLSubsetOracle implements TestOracle<MySQLGlobalState> {
         MySQLErrors.addExpressionErrors(errors);
         state.getState().logStatement(query);
         SQLancerResultSet rs = new SQLQueryAdapter(query, errors).executeAndGet(state);
-        if (rs == null) return rows;
+        if (rs == null) {
+            // null 意味着查询执行失败（如 ERROR 1690 算术溢出）
+            // 抛出异常而不是返回空集，让 verifySelectSubset 能区分
+            // "查询失败" 和 "查询成功但结果为空" 这两种情况
+            throw new SQLException("Query failed (null ResultSet): " + query);
+        }
         try {
             while (rs.next()) {
                 StringBuilder row = new StringBuilder();
