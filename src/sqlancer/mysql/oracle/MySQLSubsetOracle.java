@@ -740,7 +740,9 @@ public class MySQLSubsetOracle implements TestOracle<MySQLGlobalState> {
                 StringBuilder row = new StringBuilder();
                 for (int i = 1; i <= colCount; i++) {
                     if (i > 1) row.append("|");
-                    row.append(rs.getString(i));
+                    String val = rs.getString(i);
+                    if (val != null) val = val.stripTrailing();
+                    row.append(val);
                 }
                 rows.add(row.toString());
             }

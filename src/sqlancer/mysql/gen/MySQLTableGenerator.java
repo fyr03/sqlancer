@@ -68,6 +68,7 @@ public class MySQLTableGenerator {
             sb.append(")");
             sb.append(" ");
             appendTableOptions();
+            sb.append(" CHARACTER SET utf8mb4 COLLATE utf8mb4_bin ");
             appendPartitionOptions();
             if (engine == MySQLEngine.CSV && (tableHasNullableColumn || setPrimaryKey)) {
                 if (true) { // TODO

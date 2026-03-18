@@ -162,7 +162,10 @@ public class MySQLSubsetOracle2 implements TestOracle<MySQLGlobalState> {
             state.executeStatement(new SQLQueryAdapter(createS2Sql, true));
 
             // SQL-level random sampling: ~50% of S1 rows via RAND()
-            String sampleSQL = "INSERT IGNORE INTO " + s2Name + " SELECT * FROM " + s1Name + " WHERE RAND() < 0.5";
+            long randSeed = state.getRandomly().getLong(0, Integer.MAX_VALUE);
+            String sampleSQL = "INSERT IGNORE INTO " + s2Name
+                    + " SELECT * FROM " + s1Name
+                    + " WHERE RAND(" + randSeed + ") < 0.5";
             logSQL(sampleSQL);
             try {
                 state.executeStatement(new SQLQueryAdapter(sampleSQL, insertErrors));
@@ -706,7 +709,9 @@ public class MySQLSubsetOracle2 implements TestOracle<MySQLGlobalState> {
                 StringBuilder row = new StringBuilder();
                 for (int i = 1; i <= colCount; i++) {
                     if (i > 1) row.append("|");
-                    row.append(rs.getString(i));
+                    String val = rs.getString(i);
+                    if (val != null) val = val.stripTrailing();
+                    row.append(val);
                 }
                 rows.add(row.toString());
             }
