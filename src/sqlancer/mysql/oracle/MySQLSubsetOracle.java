@@ -468,8 +468,8 @@ public class MySQLSubsetOracle implements TestOracle<MySQLGlobalState> {
                 state.executeStatement(new SQLQueryAdapter("START TRANSACTION", true));
                 boolean queryFailed = false;
                 try {
-                    rows1 = executeAndGetRowSet(q1, s1Table.getColumns().size());
-                    rows2 = executeAndGetRowSet(q2, s1Table.getColumns().size());
+                    rows1 = executeAndGetRowSet(q1, s1Table.getColumns());
+                    rows2 = executeAndGetRowSet(q2, s1Table.getColumns());
                 } catch (SQLException e) {
                     // Q1 或 Q2 执行失败（例如算术溢出 ERROR 1690）
                     // 这不是 MySQL 的子集语义 bug，直接跳过本次检查
@@ -723,7 +723,8 @@ public class MySQLSubsetOracle implements TestOracle<MySQLGlobalState> {
         return null;
     }
 
-    private java.util.Set<String> executeAndGetRowSet(String query, int colCount) throws SQLException {
+    private java.util.Set<String> executeAndGetRowSet(String query, 
+            List<MySQLColumn> columns) throws SQLException {
         java.util.Set<String> rows = new java.util.LinkedHashSet<>();
         ExpectedErrors errors = new ExpectedErrors();
         MySQLErrors.addExpressionErrors(errors);
@@ -738,10 +739,14 @@ public class MySQLSubsetOracle implements TestOracle<MySQLGlobalState> {
         try {
             while (rs.next()) {
                 StringBuilder row = new StringBuilder();
-                for (int i = 1; i <= colCount; i++) {
+                for (int i = 1; i <= columns.size(); i++) {
                     if (i > 1) row.append("|");
                     String val = rs.getString(i);
                     if (val != null) val = val.stripTrailing();
+                    // 只对浮点列做 -0 规范化，字符串列完全不碰
+                    if (isFloatingPointColumn(columns.get(i - 1))) {
+                        val = normalizeNumericValue(val);
+                    }
                     row.append(val);
                 }
                 rows.add(row.toString());
@@ -750,6 +755,35 @@ public class MySQLSubsetOracle implements TestOracle<MySQLGlobalState> {
             rs.close();
         }
         return rows;
+    }
+
+    /**
+     * 判断是否是可能出现 -0 的浮点类型列。
+     * INT/DECIMAL 等不会产生 -0，VARCHAR/DATE 等更不会，只有 FLOAT/DOUBLE 需要处理。
+     */
+    private static boolean isFloatingPointColumn(MySQLColumn col) {
+        switch (col.getType()) {
+            case FLOAT:
+            case DOUBLE:
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    /**
+     * 仅用于浮点列：将 -0 统一归一化为正零，消除 MySQL 中 -0.0 == 0.0 的字符串差异。
+     */
+    private static String normalizeNumericValue(String val) {
+        if (val == null) return null;
+        try {
+            double d = Double.parseDouble(val);
+            if (d == 0.0 && Double.doubleToRawLongBits(d) != 0L) {
+                return val.substring(1); // "-0.0" → "0.0"，"-0" → "0"
+            }
+        } catch (NumberFormatException ignored) {
+        }
+        return val;
     }
 
     // =========================================================================
