@@ -8,6 +8,7 @@ import sqlancer.common.oracle.TestOracle;
 import sqlancer.common.query.ExpectedErrors;
 import sqlancer.mariadb.gen.MariaDBExpressionGenerator;
 import sqlancer.mariadb.oracle.MariaDBDQPOracle;
+import sqlancer.mariadb.oracle.MariaDBSubsetOracle3;
 
 public enum MariaDBOracleFactory implements OracleFactory<MariaDBProvider.MariaDBGlobalState> {
 
@@ -31,6 +32,18 @@ public enum MariaDBOracleFactory implements OracleFactory<MariaDBProvider.MariaD
         public TestOracle<MariaDBProvider.MariaDBGlobalState> create(MariaDBProvider.MariaDBGlobalState globalState)
                 throws SQLException {
             return new MariaDBDQPOracle(globalState);
+        }
+    },
+    SUBSET3 {
+        @Override
+        public TestOracle<MariaDBProvider.MariaDBGlobalState> create(MariaDBProvider.MariaDBGlobalState globalState)
+                throws SQLException {
+            return new MariaDBSubsetOracle3(globalState);
+        }
+
+        @Override
+        public boolean requiresAllTablesToContainRows() {
+            return false;
         }
     }
 }

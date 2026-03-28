@@ -1,8 +1,8 @@
-package sqlancer.mysql.oracle;
+package sqlancer.mariadb.oracle;
 
-import java.sql.SQLException;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
+import java.sql.SQLException;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
@@ -19,34 +19,26 @@ import sqlancer.common.oracle.TestOracle;
 import sqlancer.common.query.ExpectedErrors;
 import sqlancer.common.query.SQLQueryAdapter;
 import sqlancer.common.query.SQLancerResultSet;
-import sqlancer.mysql.MySQLErrors;
-import sqlancer.mysql.MySQLGlobalState;
-import sqlancer.mysql.MySQLSchema.MySQLColumn;
-import sqlancer.mysql.MySQLSchema.MySQLTable;
-import sqlancer.mysql.MySQLVisitor;
-import sqlancer.mysql.gen.MySQLExpressionGenerator;
-import sqlancer.mysql.gen.MySQLTableGenerator;
+import sqlancer.mariadb.MariaDBErrors;
+import sqlancer.mariadb.MariaDBProvider.MariaDBGlobalState;
+import sqlancer.mariadb.MariaDBSchema.MariaDBColumn;
+import sqlancer.mariadb.MariaDBSchema.MariaDBTable;
+import sqlancer.mariadb.ast.MariaDBVisitor;
+import sqlancer.mariadb.gen.MariaDBExpressionGenerator;
+import sqlancer.mariadb.gen.MariaDBTableGenerator;
 
 /**
- * Subset Oracle 3: Temporal subset + statistics refresh.
+ * Subset Oracle 3 for MariaDB: temporal subset + statistics refresh.
  *
- * <p>The oracle keeps one table and compares a baseline query before and after
- * append-only inserts plus {@code ANALYZE TABLE}. This keeps the subset idea of
- * Oracle1, while moving the subset relation into two temporal states of the
- * same table: S1 ⊆ S2.
- *
- * <p>Current core checks:
- * COUNT, MAX, MIN, and row-set containment for one fixed query shape.
- *
- * <p>Verbose output is enabled by default. Disable via system property:
- * {@code -Dsqlancer.subset.verbose=false}
+ * <p>Keeps the same high-level logic as MySQLSubsetOracle3:
+ * 1) Construct S1 + baseline query
+ * 2) Append many rows and ANALYZE TABLE to produce S2
+ * 3) Verify monotonicity and row-set subset for the same query
  */
-public class MySQLSubsetOracle3 implements TestOracle<MySQLGlobalState> {
+public class MariaDBSubsetOracle3 implements TestOracle<MariaDBGlobalState> {
 
     private static final boolean VERBOSE =
             Boolean.parseBoolean(System.getProperty("sqlancer.subset.verbose", "true"));
-    private static final boolean SUPPRESS_KNOWN_FLOAT_ZERO_MAX_NULL_BUG =
-            Boolean.parseBoolean(System.getProperty("sqlancer.subset3.suppressKnownFloatZeroMaxNullBug", "true"));
 
     private static final AtomicInteger TABLE_COUNTER = new AtomicInteger(0);
     private static final int MAX_QUERY_GENERATION_ATTEMPTS = 30;
@@ -55,7 +47,7 @@ public class MySQLSubsetOracle3 implements TestOracle<MySQLGlobalState> {
     private static final int BASELINE_NOISE_ROWS = 2;
     private static final int SKEWED_EXPANSION_ROWS = 320;
 
-    private final MySQLGlobalState state;
+    private final MariaDBGlobalState state;
     private final ExpectedErrors insertErrors;
     private String lastQueryString;
 
@@ -63,16 +55,14 @@ public class MySQLSubsetOracle3 implements TestOracle<MySQLGlobalState> {
         private final String tableName;
         private final String whereClause;
         private final String selectQuery;
-        private final List<MySQLColumn> resultColumns;
-        private final MySQLColumn predicateColumn;
+        private final List<MariaDBColumn> resultColumns;
 
-        private QuerySpec(String tableName, String whereClause, String selectQuery, List<MySQLColumn> resultColumns,
-                MySQLColumn predicateColumn) {
+        private QuerySpec(String tableName, String whereClause, String selectQuery,
+                List<MariaDBColumn> resultColumns) {
             this.tableName = tableName;
             this.whereClause = whereClause;
             this.selectQuery = selectQuery;
             this.resultColumns = resultColumns;
-            this.predicateColumn = predicateColumn;
         }
 
         private String getCountQuery() {
@@ -116,11 +106,11 @@ public class MySQLSubsetOracle3 implements TestOracle<MySQLGlobalState> {
     }
 
     private static final class SkewProfile {
-        private final MySQLColumn predicateColumn;
+        private final MariaDBColumn predicateColumn;
         private final String primaryHotValue;
         private final Map<String, List<String>> hotValuesByColumn;
 
-        private SkewProfile(MySQLColumn predicateColumn, String primaryHotValue,
+        private SkewProfile(MariaDBColumn predicateColumn, String primaryHotValue,
                 Map<String, List<String>> hotValuesByColumn) {
             this.predicateColumn = predicateColumn;
             this.primaryHotValue = primaryHotValue;
@@ -128,15 +118,14 @@ public class MySQLSubsetOracle3 implements TestOracle<MySQLGlobalState> {
         }
     }
 
-    public MySQLSubsetOracle3(MySQLGlobalState state) {
+    public MariaDBSubsetOracle3(MariaDBGlobalState state) {
         this.state = state;
         this.insertErrors = new ExpectedErrors();
-        MySQLErrors.addInsertUpdateErrors(insertErrors);
-        MySQLErrors.addExpressionErrors(insertErrors);
+        MariaDBErrors.addInsertErrors(insertErrors);
+        MariaDBErrors.addCommonErrors(insertErrors);
         insertErrors.add("Incorrect string value");
         insertErrors.add("Incorrect double value");
         insertErrors.add("Incorrect integer value");
-        insertErrors.add("Incorrect decimal value");
         insertErrors.add("Invalid utf8");
         insertErrors.add("Cannot convert");
         insertErrors.add("is not valid for CHARACTER SET");
@@ -157,24 +146,24 @@ public class MySQLSubsetOracle3 implements TestOracle<MySQLGlobalState> {
             log("\n[Step 1] Creating temporal table: " + tableName);
             SQLQueryAdapter createTable;
             do {
-                createTable = MySQLTableGenerator.generate(state, tableName);
+                createTable = MariaDBTableGenerator.generate(tableName, state.getRandomly(), state.getSchema());
             } while (createTable.getQueryString().toUpperCase().contains(" LIKE "));
             logSQL(createTable.getQueryString());
             state.executeStatement(createTable);
             state.updateSchema();
 
-            MySQLTable table = findTable(tableName);
+            MariaDBTable table = findTable(tableName);
             if (table == null) {
                 throw new IgnoreMeException();
             }
 
-            List<MySQLColumn> numericCols = table.getColumns().stream()
-                    .filter(c -> c.getType().isNumeric())
+            List<MariaDBColumn> numericCols = table.getColumns().stream()
+                    .filter(c -> isNumericColumn(c))
                     .collect(Collectors.toList());
             log("  Created with columns: " + table.getColumns().stream()
-                    .map(MySQLColumn::getName).collect(Collectors.toList()));
+                    .map(MariaDBColumn::getName).collect(Collectors.toList()));
 
-            MySQLColumn predicateColumn = choosePredicateColumn(table);
+            MariaDBColumn predicateColumn = choosePredicateColumn(table);
             ensureSupportingIndex(table, predicateColumn, id);
             SkewProfile skewProfile = createSkewProfile(table, predicateColumn);
             log("  Biased predicate column: " + predicateColumn.getName()
@@ -216,23 +205,18 @@ public class MySQLSubsetOracle3 implements TestOracle<MySQLGlobalState> {
             log("  S2 count: " + s2Snapshot.count);
             logPlan("Plan2", s2Snapshot.plan);
             log("  Plan changed after ANALYZE TABLE: " + !baseline.snapshot.plan.equals(s2Snapshot.plan));
-            suppressKnownReportedBug(table, baseline.query, baseline.snapshot, s2Snapshot);
 
             log("\n[Step 6] Checking monotonicity across S1 ⊆ S2...");
             verifyCount(baseline.query, baseline.snapshot, s2Snapshot);
-            for (MySQLColumn col : numericCols) {
+            for (MariaDBColumn col : numericCols) {
                 verifyMax(baseline.query, col.getName(), baseline.snapshot, s2Snapshot);
                 verifyMin(baseline.query, col.getName(), baseline.snapshot, s2Snapshot);
             }
             verifySelectSubset(baseline.query, baseline.snapshot, s2Snapshot);
 
-            // TODO: Extend Oracle3 with COUNT DISTINCT, IN-subquery, and join-based
-            // checks once the core temporal-state workflow stabilizes.
             log("\n  All Oracle3 core checks PASSED for round #" + id);
 
         } catch (java.sql.SQLNonTransientConnectionException e) {
-            throw new IgnoreMeException();
-        } catch (com.mysql.cj.jdbc.exceptions.CommunicationsException e) {
             throw new IgnoreMeException();
         } catch (java.sql.SQLRecoverableException e) {
             throw new IgnoreMeException();
@@ -248,7 +232,7 @@ public class MySQLSubsetOracle3 implements TestOracle<MySQLGlobalState> {
         }
     }
 
-    private BaselinePhase createValidatedBaselinePhase(MySQLTable table, List<MySQLColumn> numericCols,
+    private BaselinePhase createValidatedBaselinePhase(MariaDBTable table, List<MariaDBColumn> numericCols,
             SkewProfile skewProfile)
             throws Exception {
         for (int attempt = 0; attempt < MAX_QUERY_GENERATION_ATTEMPTS; attempt++) {
@@ -264,7 +248,7 @@ public class MySQLSubsetOracle3 implements TestOracle<MySQLGlobalState> {
         throw new IgnoreMeException();
     }
 
-    private QuerySpec buildQuerySpec(MySQLTable table, SkewProfile skewProfile) {
+    private QuerySpec buildQuerySpec(MariaDBTable table, SkewProfile skewProfile) {
         String whereClause;
         if (Randomly.getBoolean()) {
             whereClause = " WHERE `" + skewProfile.predicateColumn.getName() + "` = " + skewProfile.primaryHotValue;
@@ -279,17 +263,16 @@ public class MySQLSubsetOracle3 implements TestOracle<MySQLGlobalState> {
                 .collect(Collectors.joining(", "));
         String selectQuery = "SELECT " + selectColumns + " FROM " + table.getName() + whereClause;
         logSQL(selectQuery);
-        return new QuerySpec(table.getName(), whereClause, selectQuery, table.getColumns(),
-                skewProfile.predicateColumn);
+        return new QuerySpec(table.getName(), whereClause, selectQuery, table.getColumns());
     }
 
-    private QuerySnapshot executeSnapshot(String label, QuerySpec query, List<MySQLColumn> numericCols,
+    private QuerySnapshot executeSnapshot(String label, QuerySpec query, List<MariaDBColumn> numericCols,
             boolean captureRows) throws Exception {
         Long count = executeSingleLong(query.getCountQuery());
         Set<String> rowDigests = captureRows ? executeAndGetRowDigests(query.selectQuery, query.resultColumns) : null;
         Map<String, Double> maxValues = new LinkedHashMap<>();
         Map<String, Double> minValues = new LinkedHashMap<>();
-        for (MySQLColumn col : numericCols) {
+        for (MariaDBColumn col : numericCols) {
             maxValues.put(col.getName(), executeSingleDouble(query.getMaxQuery(col.getName())));
             minValues.put(col.getName(), executeSingleDouble(query.getMinQuery(col.getName())));
         }
@@ -298,58 +281,6 @@ public class MySQLSubsetOracle3 implements TestOracle<MySQLGlobalState> {
             log("  " + label + " result rows: " + rowDigests.size());
         }
         return new QuerySnapshot(count, rowDigests, maxValues, minValues, plan);
-    }
-
-    private void suppressKnownReportedBug(MySQLTable table, QuerySpec query, QuerySnapshot s1, QuerySnapshot s2)
-            throws Exception {
-        if (!SUPPRESS_KNOWN_FLOAT_ZERO_MAX_NULL_BUG) {
-            return;
-        }
-        if (!isKnownFloatZeroMaxNullBugCandidate(query, s1, s2)) {
-            return;
-        }
-        Double ignoreIndexMax = executeSingleDouble(buildIgnoreIndexMaxQuery(table, query));
-        if (ignoreIndexMax == null || Math.abs(ignoreIndexMax) > 1e-9) {
-            return;
-        }
-        log("  Known reported MySQL bug pattern detected (FLOAT/DOUBLE `= 0.0` index path leaks NULL).");
-        log("  Suppressing this round so Oracle3 can continue searching for new bugs.");
-        throw new IgnoreMeException();
-    }
-
-    private boolean isKnownFloatZeroMaxNullBugCandidate(QuerySpec query, QuerySnapshot s1, QuerySnapshot s2) {
-        if (query.predicateColumn == null || !isFloatingPointColumn(query.predicateColumn)) {
-            return false;
-        }
-        String expectedWhere = " WHERE `" + query.predicateColumn.getName() + "` = 0.0";
-        if (!expectedWhere.equals(query.whereClause)) {
-            return false;
-        }
-        if (s1.count == null || s1.count <= 0 || s2.count == null || s2.count <= 0) {
-            return false;
-        }
-        Double s1Max = s1.maxValues.get(query.predicateColumn.getName());
-        Double s2Max = s2.maxValues.get(query.predicateColumn.getName());
-        Double s2Min = s2.minValues.get(query.predicateColumn.getName());
-        return s1Max != null
-                && Math.abs(s1Max) <= 1e-9
-                && s2Max == null
-                && s2Min != null
-                && Math.abs(s2Min) <= 1e-9;
-    }
-
-    private String buildIgnoreIndexMaxQuery(MySQLTable table, QuerySpec query) {
-        MySQLTable currentTable = findTable(query.tableName);
-        MySQLTable tableWithFreshIndexes = currentTable != null ? currentTable : table;
-        String ignoreIndexClause = tableWithFreshIndexes.getIndexes().stream()
-                .map(idx -> idx.getIndexName())
-                .filter(idx -> !"`PRIMARY`".equalsIgnoreCase(idx) && !"PRIMARY".equalsIgnoreCase(idx))
-                .collect(Collectors.joining(", "));
-        if (ignoreIndexClause.isEmpty()) {
-            return query.getMaxQuery(query.predicateColumn.getName());
-        }
-        return "SELECT MAX(`" + query.predicateColumn.getName() + "`) FROM " + query.tableName
-                + " IGNORE INDEX (" + ignoreIndexClause + ")" + query.whereClause;
     }
 
     private void verifyCount(QuerySpec query, QuerySnapshot s1, QuerySnapshot s2) {
@@ -411,7 +342,7 @@ public class MySQLSubsetOracle3 implements TestOracle<MySQLGlobalState> {
         Set<String> missing = removePresentRowDigests(query.selectQuery, query.resultColumns, s1.rowDigests);
         boolean pass = missing.isEmpty();
         log(String.format("  ROW-SET    |S1|=%-6d subset |S2|=%-6d   [%s]",
-                s1.rowDigests.size(), s2.count, pass ? "PASS" : "FAIL"));
+                s1.rowDigests.size(), s2.count == null ? 0L : s2.count, pass ? "PASS" : "FAIL"));
         if (!pass) {
             lastQueryString = query.selectQuery;
             throw new AssertionError(String.format(
@@ -421,12 +352,12 @@ public class MySQLSubsetOracle3 implements TestOracle<MySQLGlobalState> {
         }
     }
 
-    private void appendHotSeedRows(MySQLTable table, SkewProfile skewProfile, int nrRows) {
+    private void appendHotSeedRows(MariaDBTable table, SkewProfile skewProfile, int nrRows) {
         for (int i = 0; i < nrRows; i++) {
             try {
-                MySQLExpressionGenerator gen = new MySQLExpressionGenerator(state).setColumns(table.getColumns());
+                MariaDBExpressionGenerator gen = new MariaDBExpressionGenerator(state.getRandomly()).setColumns(table.getColumns());
                 List<String> values = new ArrayList<>();
-                for (MySQLColumn col : table.getColumns()) {
+                for (MariaDBColumn col : table.getColumns()) {
                     if (col.getName().equals(skewProfile.predicateColumn.getName())) {
                         values.add(skewProfile.primaryHotValue);
                     } else {
@@ -440,11 +371,11 @@ public class MySQLSubsetOracle3 implements TestOracle<MySQLGlobalState> {
         }
     }
 
-    private void appendSkewedRows(MySQLTable table, SkewProfile skewProfile, int nrRows, double hotspotProbability) {
-        List<MySQLColumn> cols = table.getColumns();
+    private void appendSkewedRows(MariaDBTable table, SkewProfile skewProfile, int nrRows, double hotspotProbability) {
+        List<MariaDBColumn> cols = table.getColumns();
         for (int i = 0; i < nrRows; i++) {
             try {
-                MySQLExpressionGenerator gen = new MySQLExpressionGenerator(state).setColumns(cols);
+                MariaDBExpressionGenerator gen = new MariaDBExpressionGenerator(state.getRandomly()).setColumns(cols);
                 List<String> values = cols.stream()
                         .map(c -> generateValue(c, gen, skewProfile, hotspotProbability))
                         .collect(Collectors.toList());
@@ -458,7 +389,7 @@ public class MySQLSubsetOracle3 implements TestOracle<MySQLGlobalState> {
     private void analyzeTable(String tableName) throws Exception {
         String analyzeSql = "ANALYZE TABLE " + tableName;
         ExpectedErrors errors = new ExpectedErrors();
-        MySQLErrors.addExpressionErrors(errors);
+        MariaDBErrors.addCommonErrors(errors);
         logSQL(analyzeSql);
         state.executeStatement(new SQLQueryAdapter(analyzeSql, errors));
     }
@@ -467,7 +398,7 @@ public class MySQLSubsetOracle3 implements TestOracle<MySQLGlobalState> {
         String explainQuery = "EXPLAIN " + selectQuery;
         lastQueryString = explainQuery;
         ExpectedErrors errors = new ExpectedErrors();
-        MySQLErrors.addExpressionErrors(errors);
+        MariaDBErrors.addCommonErrors(errors);
         state.getState().logStatement(explainQuery);
         SQLancerResultSet rs = new SQLQueryAdapter(explainQuery, errors).executeAndGet(state);
         if (rs == null) {
@@ -477,13 +408,13 @@ public class MySQLSubsetOracle3 implements TestOracle<MySQLGlobalState> {
             List<String> planRows = new ArrayList<>();
             while (rs.next()) {
                 planRows.add(String.format("id=%s;select=%s;table=%s;type=%s;key=%s;rows=%s;extra=%s",
-                        nullToEmpty(getOptionalString(rs, 1)),
-                        nullToEmpty(getOptionalString(rs, 2)),
-                        nullToEmpty(getOptionalString(rs, 3)),
-                        nullToEmpty(getOptionalString(rs, 4)),
-                        nullToEmpty(getOptionalString(rs, 6)),
-                        nullToEmpty(getOptionalString(rs, 10)),
-                        nullToEmpty(getOptionalString(rs, 12))));
+                        nullToEmpty(getOptionalString(rs, "id")),
+                        nullToEmpty(getOptionalString(rs, "select_type")),
+                        nullToEmpty(getOptionalString(rs, "table")),
+                        nullToEmpty(getOptionalString(rs, "type")),
+                        nullToEmpty(getOptionalString(rs, "key")),
+                        nullToEmpty(getOptionalString(rs, "rows")),
+                        nullToEmpty(getOptionalString(rs, "Extra"))));
             }
             return planRows;
         } finally {
@@ -491,10 +422,10 @@ public class MySQLSubsetOracle3 implements TestOracle<MySQLGlobalState> {
         }
     }
 
-    private void insertNoiseRows(MySQLTable table, int nrRows) {
-        List<MySQLColumn> cols = table.getColumns();
-        Map<MySQLColumn, List<String>> boundaryMap = new LinkedHashMap<>();
-        for (MySQLColumn col : cols) {
+    private void insertNoiseRows(MariaDBTable table, int nrRows) {
+        List<MariaDBColumn> cols = table.getColumns();
+        Map<MariaDBColumn, List<String>> boundaryMap = new LinkedHashMap<>();
+        for (MariaDBColumn col : cols) {
             List<String> vals = new ArrayList<>();
             switch (col.getType()) {
             case INT:
@@ -511,13 +442,12 @@ public class MySQLSubsetOracle3 implements TestOracle<MySQLGlobalState> {
                 vals.add("''");
                 vals.add("'" + "a".repeat(500) + "'");
                 vals.add("'%'");
-                vals.add("'_'");
+                vals.add("'_'" );
                 vals.add("'NULL'");
                 vals.add("'0'");
                 vals.add("NULL");
                 break;
-            case FLOAT:
-            case DOUBLE:
+            case REAL:
                 vals.add("0");
                 vals.add("0.0");
                 vals.add("-0.0");
@@ -529,13 +459,9 @@ public class MySQLSubsetOracle3 implements TestOracle<MySQLGlobalState> {
                 vals.add("1.4E-45");
                 vals.add("NULL");
                 break;
-            case DECIMAL:
-                vals.add("0");
-                vals.add("0.00");
-                vals.add("1.00");
-                vals.add("-1.00");
-                vals.add("99999999999999999999999999999999999.99");
-                vals.add("-99999999999999999999999999999999999.99");
+            case BOOLEAN:
+                vals.add("TRUE");
+                vals.add("FALSE");
                 vals.add("NULL");
                 break;
             default:
@@ -546,10 +472,10 @@ public class MySQLSubsetOracle3 implements TestOracle<MySQLGlobalState> {
         }
 
         for (int i = 0; i < nrRows; i++) {
-            MySQLColumn targetCol = Randomly.fromList(cols);
+            MariaDBColumn targetCol = Randomly.fromList(cols);
             String boundaryVal = Randomly.fromList(boundaryMap.get(targetCol));
             List<String> values = new ArrayList<>();
-            for (MySQLColumn col : cols) {
+            for (MariaDBColumn col : cols) {
                 values.add(col.equals(targetCol) ? boundaryVal : "NULL");
             }
             try {
@@ -560,16 +486,16 @@ public class MySQLSubsetOracle3 implements TestOracle<MySQLGlobalState> {
         }
     }
 
-    private SkewProfile createSkewProfile(MySQLTable table, MySQLColumn predicateColumn) {
+    private SkewProfile createSkewProfile(MariaDBTable table, MariaDBColumn predicateColumn) {
         Map<String, List<String>> hotValuesByColumn = new LinkedHashMap<>();
-        for (MySQLColumn col : table.getColumns()) {
+        for (MariaDBColumn col : table.getColumns()) {
             hotValuesByColumn.put(col.getName(), createHotValues(col));
         }
         String primaryHotValue = hotValuesByColumn.get(predicateColumn.getName()).get(0);
         return new SkewProfile(predicateColumn, primaryHotValue, hotValuesByColumn);
     }
 
-    private List<String> createHotValues(MySQLColumn col) {
+    private List<String> createHotValues(MariaDBColumn col) {
         List<String> hotValues = new ArrayList<>();
         switch (col.getType()) {
         case INT:
@@ -582,16 +508,15 @@ public class MySQLSubsetOracle3 implements TestOracle<MySQLGlobalState> {
             hotValues.add("'skew'");
             hotValues.add("'bias'");
             break;
-        case FLOAT:
-        case DOUBLE:
+        case REAL:
             hotValues.add("0.0");
             hotValues.add("1.0");
             hotValues.add("3.14");
             break;
-        case DECIMAL:
-            hotValues.add("0.00");
-            hotValues.add("1.00");
-            hotValues.add("9.99");
+        case BOOLEAN:
+            hotValues.add("TRUE");
+            hotValues.add("FALSE");
+            hotValues.add("NULL");
             break;
         default:
             hotValues.add("NULL");
@@ -600,15 +525,15 @@ public class MySQLSubsetOracle3 implements TestOracle<MySQLGlobalState> {
         return hotValues;
     }
 
-    private MySQLColumn choosePredicateColumn(MySQLTable table) {
-        List<MySQLColumn> preferredCols = table.getColumns().stream()
+    private MariaDBColumn choosePredicateColumn(MariaDBTable table) {
+        List<MariaDBColumn> preferredCols = table.getColumns().stream()
                 .filter(c -> !c.isPrimaryKey())
-                .filter(c -> c.getType().isNumeric() || c.getType() == sqlancer.mysql.MySQLSchema.MySQLDataType.VARCHAR)
+                .filter(c -> isNumericColumn(c) || c.getType() == sqlancer.mariadb.MariaDBSchema.MariaDBDataType.VARCHAR)
                 .collect(Collectors.toList());
         if (!preferredCols.isEmpty()) {
             return Randomly.fromList(preferredCols);
         }
-        List<MySQLColumn> nonPrimaryCols = table.getColumns().stream()
+        List<MariaDBColumn> nonPrimaryCols = table.getColumns().stream()
                 .filter(c -> !c.isPrimaryKey())
                 .collect(Collectors.toList());
         if (!nonPrimaryCols.isEmpty()) {
@@ -617,12 +542,12 @@ public class MySQLSubsetOracle3 implements TestOracle<MySQLGlobalState> {
         return Randomly.fromList(table.getColumns());
     }
 
-    private void ensureSupportingIndex(MySQLTable table, MySQLColumn predicateColumn, int id) {
+    private void ensureSupportingIndex(MariaDBTable table, MariaDBColumn predicateColumn, int id) {
         String indexName = "i_subset3_" + id;
         String createIndexSql = "CREATE INDEX " + indexName + " ON " + table.getName()
                 + " (`" + predicateColumn.getName() + "`)";
         ExpectedErrors errors = new ExpectedErrors();
-        MySQLErrors.addExpressionErrors(errors);
+        MariaDBErrors.addCommonErrors(errors);
         errors.add("Duplicate key name");
         errors.add("Specified key was too long");
         errors.add("used in key specification without a key length");
@@ -635,16 +560,16 @@ public class MySQLSubsetOracle3 implements TestOracle<MySQLGlobalState> {
         }
     }
 
-    private String generateValue(MySQLColumn col, MySQLExpressionGenerator gen, SkewProfile skewProfile,
+    private String generateValue(MariaDBColumn col, MariaDBExpressionGenerator gen, SkewProfile skewProfile,
             double hotspotProbability) {
         List<String> hotValues = skewProfile.hotValuesByColumn.get(col.getName());
         if (hotValues != null && Randomly.getPercentage() < hotspotProbability) {
             return Randomly.fromList(hotValues);
         }
-        return MySQLVisitor.asString(gen.generateConstant());
+        return MariaDBVisitor.asString(MariaDBExpressionGenerator.getRandomConstant(state.getRandomly(), col.getType()));
     }
 
-    private void executeInsert(MySQLTable table, List<String> values) throws Exception {
+    private void executeInsert(MariaDBTable table, List<String> values) throws Exception {
         StringBuilder sb = new StringBuilder("INSERT IGNORE INTO ");
         sb.append(table.getName()).append(" (");
         sb.append(table.getColumns().stream().map(c -> "`" + c.getName() + "`").collect(Collectors.joining(", ")));
@@ -655,7 +580,7 @@ public class MySQLSubsetOracle3 implements TestOracle<MySQLGlobalState> {
         state.executeStatement(new SQLQueryAdapter(sb.toString(), insertErrors));
     }
 
-    private MySQLTable findTable(String name) {
+    private MariaDBTable findTable(String name) {
         return state.getSchema().getDatabaseTables().stream()
                 .filter(t -> t.getName().equalsIgnoreCase(name))
                 .findFirst().orElse(null);
@@ -663,7 +588,6 @@ public class MySQLSubsetOracle3 implements TestOracle<MySQLGlobalState> {
 
     private void dropIfExists(String tableName) {
         try {
-            // couldAffectSchema=true ensures SQLancer refreshes the schema cache in executeEpilogue
             state.executeStatement(new SQLQueryAdapter("DROP TABLE IF EXISTS " + tableName, true));
         } catch (Exception ignored) {
         }
@@ -672,7 +596,7 @@ public class MySQLSubsetOracle3 implements TestOracle<MySQLGlobalState> {
     private Long executeSingleLong(String query) throws SQLException {
         lastQueryString = query;
         ExpectedErrors errors = new ExpectedErrors();
-        MySQLErrors.addExpressionErrors(errors);
+        MariaDBErrors.addCommonErrors(errors);
         state.getState().logStatement(query);
         SQLancerResultSet rs = new SQLQueryAdapter(query, errors).executeAndGet(state);
         if (rs == null) {
@@ -691,7 +615,7 @@ public class MySQLSubsetOracle3 implements TestOracle<MySQLGlobalState> {
     private Double executeSingleDouble(String query) throws SQLException {
         lastQueryString = query;
         ExpectedErrors errors = new ExpectedErrors();
-        MySQLErrors.addExpressionErrors(errors);
+        MariaDBErrors.addCommonErrors(errors);
         state.getState().logStatement(query);
         SQLancerResultSet rs = new SQLQueryAdapter(query, errors).executeAndGet(state);
         if (rs == null) {
@@ -715,10 +639,10 @@ public class MySQLSubsetOracle3 implements TestOracle<MySQLGlobalState> {
         return null;
     }
 
-    private Set<String> executeAndGetRowDigests(String query, List<MySQLColumn> columns) throws SQLException {
+    private Set<String> executeAndGetRowDigests(String query, List<MariaDBColumn> columns) throws SQLException {
         Set<String> rowDigests = new LinkedHashSet<>();
         ExpectedErrors errors = new ExpectedErrors();
-        MySQLErrors.addExpressionErrors(errors);
+        MariaDBErrors.addCommonErrors(errors);
         state.getState().logStatement(query);
         SQLancerResultSet rs = new SQLQueryAdapter(query, errors).executeAndGet(state);
         if (rs == null) {
@@ -734,11 +658,11 @@ public class MySQLSubsetOracle3 implements TestOracle<MySQLGlobalState> {
         return rowDigests;
     }
 
-    private Set<String> removePresentRowDigests(String query, List<MySQLColumn> columns, Set<String> expectedDigests)
+    private Set<String> removePresentRowDigests(String query, List<MariaDBColumn> columns, Set<String> expectedDigests)
             throws SQLException {
         Set<String> missing = new LinkedHashSet<>(expectedDigests);
         ExpectedErrors errors = new ExpectedErrors();
-        MySQLErrors.addExpressionErrors(errors);
+        MariaDBErrors.addCommonErrors(errors);
         state.getState().logStatement(query);
         SQLancerResultSet rs = new SQLQueryAdapter(query, errors).executeAndGet(state);
         if (rs == null) {
@@ -754,7 +678,7 @@ public class MySQLSubsetOracle3 implements TestOracle<MySQLGlobalState> {
         return missing;
     }
 
-    private String computeCurrentRowDigest(SQLancerResultSet rs, List<MySQLColumn> columns) throws SQLException {
+    private String computeCurrentRowDigest(SQLancerResultSet rs, List<MariaDBColumn> columns) throws SQLException {
         MessageDigest digest = newRowDigest();
         for (int i = 1; i <= columns.size(); i++) {
             if (i > 1) {
@@ -790,10 +714,19 @@ public class MySQLSubsetOracle3 implements TestOracle<MySQLGlobalState> {
         return sb.toString();
     }
 
-    private static boolean isFloatingPointColumn(MySQLColumn col) {
+    private static boolean isFloatingPointColumn(MariaDBColumn col) {
         switch (col.getType()) {
-        case FLOAT:
-        case DOUBLE:
+        case REAL:
+            return true;
+        default:
+            return false;
+        }
+    }
+
+    private static boolean isNumericColumn(MariaDBColumn col) {
+        switch (col.getType()) {
+        case INT:
+        case REAL:
             return true;
         default:
             return false;
@@ -814,9 +747,9 @@ public class MySQLSubsetOracle3 implements TestOracle<MySQLGlobalState> {
         return val;
     }
 
-    private static String getOptionalString(SQLancerResultSet rs, int index) throws SQLException {
+    private static String getOptionalString(SQLancerResultSet rs, String identifier) throws SQLException {
         try {
-            return rs.getString(index);
+            return rs.getString(identifier);
         } catch (SQLException e) {
             return null;
         }
@@ -865,7 +798,7 @@ public class MySQLSubsetOracle3 implements TestOracle<MySQLGlobalState> {
     }
 
     @Override
-    public Reproducer<MySQLGlobalState> getLastReproducer() {
+    public Reproducer<MariaDBGlobalState> getLastReproducer() {
         return null;
     }
 
