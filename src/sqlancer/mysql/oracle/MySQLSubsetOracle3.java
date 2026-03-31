@@ -49,11 +49,13 @@ public class MySQLSubsetOracle3 implements TestOracle<MySQLGlobalState> {
             Boolean.parseBoolean(System.getProperty("sqlancer.subset3.suppressKnownFloatZeroMaxNullBug", "true"));
 
     private static final AtomicInteger TABLE_COUNTER = new AtomicInteger(0);
-    private static final int MAX_QUERY_GENERATION_ATTEMPTS = 30;
+    private static final int TARGET_BASELINE_QUERIES = 6;
+    private static final int MIN_BASELINE_QUERIES = 3;
+    private static final int MAX_QUERY_GENERATION_ATTEMPTS = 72;
     private static final int BASELINE_RANDOM_ROWS = 4;
     private static final int BASELINE_HOT_ROWS = 2;
-    private static final int BASELINE_NOISE_ROWS = 2;
-    private static final int SKEWED_EXPANSION_ROWS = 320;
+    private static final int BASELINE_NOISE_ROWS = 4;
+    private static final int SKEWED_EXPANSION_ROWS = 5000;
 
     private final MySQLGlobalState state;
     private final ExpectedErrors insertErrors;
@@ -118,14 +120,42 @@ public class MySQLSubsetOracle3 implements TestOracle<MySQLGlobalState> {
     private static final class SkewProfile {
         private final MySQLColumn predicateColumn;
         private final String primaryHotValue;
+        private final String secondaryHotValue;
+        private final String tertiaryHotValue;
+        private final PredicateShiftMode shiftMode;
         private final Map<String, List<String>> hotValuesByColumn;
 
-        private SkewProfile(MySQLColumn predicateColumn, String primaryHotValue,
+        private SkewProfile(MySQLColumn predicateColumn, String primaryHotValue, String secondaryHotValue,
+                String tertiaryHotValue, PredicateShiftMode shiftMode,
                 Map<String, List<String>> hotValuesByColumn) {
             this.predicateColumn = predicateColumn;
             this.primaryHotValue = primaryHotValue;
+            this.secondaryHotValue = secondaryHotValue;
+            this.tertiaryHotValue = tertiaryHotValue;
+            this.shiftMode = shiftMode;
             this.hotValuesByColumn = hotValuesByColumn;
         }
+    }
+
+    private enum DistributionStage {
+        BASELINE,
+        EXPANSION
+    }
+
+    private enum PredicateShiftMode {
+        PRIMARY_HEAVY,
+        PRIMARY_SECONDARY_SPLIT,
+        SECONDARY_HEAVY,
+        NULL_HEAVY,
+        NOISE_HEAVY
+    }
+
+    private enum ProjectionStyle {
+        ALL_COLUMNS,
+        PREDICATE_ONLY,
+        PREDICATE_PLUS_ONE,
+        RANDOM_SUBSET,
+        NON_PREDICATE_FOCUS
     }
 
     public MySQLSubsetOracle3(MySQLGlobalState state) {
@@ -175,14 +205,15 @@ public class MySQLSubsetOracle3 implements TestOracle<MySQLGlobalState> {
                     .map(MySQLColumn::getName).collect(Collectors.toList()));
 
             MySQLColumn predicateColumn = choosePredicateColumn(table);
-            ensureSupportingIndex(table, predicateColumn, id);
+            ensureSupportingIndexes(table, predicateColumn, id);
             SkewProfile skewProfile = createSkewProfile(table, predicateColumn);
             log("  Biased predicate column: " + predicateColumn.getName()
                     + " with hot value " + skewProfile.primaryHotValue);
 
             log("\n[Step 2] Building baseline state S1 with append-only inserts...");
             appendHotSeedRows(table, skewProfile, BASELINE_HOT_ROWS);
-            appendSkewedRows(table, skewProfile, BASELINE_RANDOM_ROWS + Randomly.smallNumber(), 0.35);
+            appendSkewedRows(table, skewProfile, BASELINE_RANDOM_ROWS + Randomly.smallNumber(), 0.35,
+                    DistributionStage.BASELINE);
             log("  Inserting a few boundary/null seed rows into S1...");
             insertNoiseRows(table, BASELINE_NOISE_ROWS);
             Long s1TableCount = executeSingleLong("SELECT COUNT(*) FROM " + tableName);
@@ -192,13 +223,18 @@ public class MySQLSubsetOracle3 implements TestOracle<MySQLGlobalState> {
             log("  S1 row count: " + s1TableCount);
 
             log("\n[Step 3] Selecting baseline query Q and collecting Res1 / Plan1...");
-            BaselinePhase baseline = createValidatedBaselinePhase(table, numericCols, skewProfile);
-            log("  Baseline count: " + baseline.snapshot.count);
-            logPlan("Plan1", baseline.snapshot.plan);
+            List<BaselinePhase> baselines = createValidatedBaselinePhases(table, numericCols, skewProfile);
+            log("  Validated baseline queries: " + baselines.size());
+            for (int i = 0; i < baselines.size(); i++) {
+                BaselinePhase baseline = baselines.get(i);
+                log("  Baseline[" + (i + 1) + "] count: " + baseline.snapshot.count);
+                logPlan("Plan1[" + (i + 1) + "]", baseline.snapshot.plan);
+            }
 
             log("\n[Step 4] Appending many skewed rows, COMMIT, and ANALYZE TABLE...");
             state.executeStatement(new SQLQueryAdapter("START TRANSACTION", false));
-            appendSkewedRows(table, skewProfile, SKEWED_EXPANSION_ROWS + 32 * Randomly.smallNumber(), 0.92);
+            appendSkewedRows(table, skewProfile, SKEWED_EXPANSION_ROWS + 64 * Randomly.smallNumber(), 0.92,
+                    DistributionStage.EXPANSION);
             state.executeStatement(new SQLQueryAdapter("COMMIT", false));
 
             Long s2TableCount = executeSingleLong("SELECT COUNT(*) FROM " + tableName);
@@ -211,20 +247,26 @@ public class MySQLSubsetOracle3 implements TestOracle<MySQLGlobalState> {
 
             analyzeTable(tableName);
 
-            log("\n[Step 5] Re-running the same query Q on S2...");
-            QuerySnapshot s2Snapshot = executeSnapshot("S2", baseline.query, numericCols, false);
-            log("  S2 count: " + s2Snapshot.count);
-            logPlan("Plan2", s2Snapshot.plan);
-            log("  Plan changed after ANALYZE TABLE: " + !baseline.snapshot.plan.equals(s2Snapshot.plan));
-            suppressKnownReportedBug(table, baseline.query, baseline.snapshot, s2Snapshot);
+            log("\n[Step 5] Re-running the same queries on S2...");
+            for (int i = 0; i < baselines.size(); i++) {
+                BaselinePhase baseline = baselines.get(i);
+                log("  Query[" + (i + 1) + "]: " + baseline.query.selectQuery);
+                QuerySnapshot s2Snapshot = executeSnapshot("S2", baseline.query, numericCols, false);
+                log("  S2 count[" + (i + 1) + "]: " + s2Snapshot.count);
+                logPlan("Plan2[" + (i + 1) + "]", s2Snapshot.plan);
+                log("  Plan changed after ANALYZE TABLE [" + (i + 1) + "]: "
+                        + !baseline.snapshot.plan.equals(s2Snapshot.plan));
+                suppressKnownReportedBug(table, baseline.query, baseline.snapshot, s2Snapshot);
 
             log("\n[Step 6] Checking monotonicity across S1 ⊆ S2...");
-            verifyCount(baseline.query, baseline.snapshot, s2Snapshot);
-            for (MySQLColumn col : numericCols) {
-                verifyMax(baseline.query, col.getName(), baseline.snapshot, s2Snapshot);
-                verifyMin(baseline.query, col.getName(), baseline.snapshot, s2Snapshot);
+                log("\n[Step 6." + (i + 1) + "] Checking monotonicity across S1/S2...");
+                verifyCount(baseline.query, baseline.snapshot, s2Snapshot);
+                for (MySQLColumn col : numericCols) {
+                    verifyMax(baseline.query, col.getName(), baseline.snapshot, s2Snapshot);
+                    verifyMin(baseline.query, col.getName(), baseline.snapshot, s2Snapshot);
+                }
+                verifySelectSubset(baseline.query, baseline.snapshot, s2Snapshot);
             }
-            verifySelectSubset(baseline.query, baseline.snapshot, s2Snapshot);
 
             // TODO: Extend Oracle3 with COUNT DISTINCT, IN-subquery, and join-based
             // checks once the core temporal-state workflow stabilizes.
@@ -248,39 +290,150 @@ public class MySQLSubsetOracle3 implements TestOracle<MySQLGlobalState> {
         }
     }
 
-    private BaselinePhase createValidatedBaselinePhase(MySQLTable table, List<MySQLColumn> numericCols,
-            SkewProfile skewProfile)
-            throws Exception {
-        for (int attempt = 0; attempt < MAX_QUERY_GENERATION_ATTEMPTS; attempt++) {
+    private List<BaselinePhase> createValidatedBaselinePhases(MySQLTable table, List<MySQLColumn> numericCols,
+            SkewProfile skewProfile) throws Exception {
+        Map<String, BaselinePhase> phases = new LinkedHashMap<>();
+        for (int attempt = 0; attempt < MAX_QUERY_GENERATION_ATTEMPTS && phases.size() < TARGET_BASELINE_QUERIES;
+                attempt++) {
             QuerySpec candidate = buildQuerySpec(table, skewProfile);
+            if (phases.containsKey(candidate.selectQuery)) {
+                continue;
+            }
             try {
                 QuerySnapshot snapshot = executeSnapshot("S1", candidate, numericCols, true);
-                return new BaselinePhase(candidate, snapshot);
+                if (snapshot.count == null || snapshot.count == 0L) {
+                    log("  Query candidate #" + (attempt + 1) + " skipped: empty baseline result");
+                    continue;
+                }
+                phases.put(candidate.selectQuery, new BaselinePhase(candidate, snapshot));
             } catch (Throwable t) {
                 log("  Query candidate #" + (attempt + 1) + " skipped: "
                         + t.getClass().getSimpleName() + ": " + t.getMessage());
             }
         }
-        throw new IgnoreMeException();
+        if (phases.size() < MIN_BASELINE_QUERIES) {
+            throw new IgnoreMeException();
+        }
+        return new ArrayList<>(phases.values());
     }
 
     private QuerySpec buildQuerySpec(MySQLTable table, SkewProfile skewProfile) {
-        String whereClause;
-        if (Randomly.getBoolean()) {
-            whereClause = " WHERE `" + skewProfile.predicateColumn.getName() + "` = " + skewProfile.primaryHotValue;
-        } else {
-            List<String> hotValues = skewProfile.hotValuesByColumn.get(skewProfile.predicateColumn.getName());
-            String secondaryHotValue = hotValues.size() > 1 ? hotValues.get(1) : skewProfile.primaryHotValue;
-            whereClause = " WHERE `" + skewProfile.predicateColumn.getName() + "` IN ("
-                    + skewProfile.primaryHotValue + ", " + secondaryHotValue + ")";
-        }
-        String selectColumns = table.getColumns().stream()
+        String whereClause = buildWhereClause(skewProfile);
+        List<MySQLColumn> projectionColumns = chooseProjectionColumns(table, skewProfile.predicateColumn);
+        String selectColumns = projectionColumns.stream()
                 .map(c -> "`" + c.getName() + "`")
                 .collect(Collectors.joining(", "));
         String selectQuery = "SELECT " + selectColumns + " FROM " + table.getName() + whereClause;
         logSQL(selectQuery);
-        return new QuerySpec(table.getName(), whereClause, selectQuery, table.getColumns(),
-                skewProfile.predicateColumn);
+        return new QuerySpec(table.getName(), whereClause, selectQuery, projectionColumns, skewProfile.predicateColumn);
+    }
+
+    private String buildWhereClause(SkewProfile skewProfile) {
+        MySQLColumn predicate = skewProfile.predicateColumn;
+        switch (predicate.getType()) {
+        case INT:
+        case FLOAT:
+        case DOUBLE:
+        case DECIMAL:
+            return buildNumericWhereClause(predicate, skewProfile);
+        case VARCHAR:
+            return buildVarcharWhereClause(predicate, skewProfile);
+        default:
+            return " WHERE `" + predicate.getName() + "` = " + skewProfile.primaryHotValue;
+        }
+    }
+
+    private String buildNumericWhereClause(MySQLColumn predicate, SkewProfile skewProfile) {
+        String col = "`" + predicate.getName() + "`";
+        switch (Randomly.fromOptions(0, 1, 2, 3, 4, 5)) {
+        case 0:
+            return " WHERE " + col + " = " + skewProfile.primaryHotValue;
+        case 1:
+            return " WHERE " + col + " IN (" + skewProfile.primaryHotValue + ", " + skewProfile.secondaryHotValue
+                    + ")";
+        case 2:
+            return " WHERE " + col + " BETWEEN " + skewProfile.primaryHotValue + " AND "
+                    + skewProfile.secondaryHotValue;
+        case 3:
+            return " WHERE " + col + " <= " + skewProfile.secondaryHotValue;
+        case 4:
+            return " WHERE " + col + " >= " + skewProfile.primaryHotValue;
+        default:
+            return " WHERE " + col + " IS NULL";
+        }
+    }
+
+    private String buildVarcharWhereClause(MySQLColumn predicate, SkewProfile skewProfile) {
+        String col = "`" + predicate.getName() + "`";
+        String primary = skewProfile.primaryHotValue;
+        String secondary = skewProfile.secondaryHotValue;
+        String primaryLiteral = unquoteLiteral(primary);
+        String prefix = primaryLiteral.isEmpty() ? "h" : primaryLiteral.substring(0, 1);
+        switch (Randomly.fromOptions(0, 1, 2, 3, 4)) {
+        case 0:
+            return " WHERE " + col + " = " + primary;
+        case 1:
+            return " WHERE " + col + " IN (" + primary + ", " + secondary + ")";
+        case 2:
+            return " WHERE " + col + " LIKE '" + prefix + "%'";
+        case 3:
+            return " WHERE " + col + " >= " + primary;
+        default:
+            return " WHERE " + col + " IS NULL";
+        }
+    }
+
+    private List<MySQLColumn> chooseProjectionColumns(MySQLTable table, MySQLColumn predicateColumn) {
+        List<MySQLColumn> allColumns = table.getColumns();
+        ProjectionStyle style = Randomly.fromOptions(ProjectionStyle.values());
+        LinkedHashSet<MySQLColumn> chosen = new LinkedHashSet<>();
+        switch (style) {
+        case ALL_COLUMNS:
+            chosen.addAll(allColumns);
+            break;
+        case PREDICATE_ONLY:
+            chosen.add(predicateColumn);
+            break;
+        case PREDICATE_PLUS_ONE:
+            chosen.add(predicateColumn);
+            allColumns.stream().filter(c -> !c.equals(predicateColumn)).findAny().ifPresent(chosen::add);
+            break;
+        case RANDOM_SUBSET:
+            chosen.add(predicateColumn);
+            List<MySQLColumn> shuffled = Randomly.nonEmptySubset(allColumns);
+            chosen.addAll(shuffled.stream().limit(1 + Randomly.smallNumber()).collect(Collectors.toList()));
+            break;
+        case NON_PREDICATE_FOCUS:
+            List<MySQLColumn> nonPredicate = allColumns.stream()
+                    .filter(c -> !c.equals(predicateColumn))
+                    .collect(Collectors.toList());
+            if (nonPredicate.isEmpty()) {
+                chosen.add(predicateColumn);
+            } else {
+                chosen.addAll(Randomly.nonEmptySubset(nonPredicate).stream()
+                        .limit(Math.min(nonPredicate.size(), 1 + Randomly.smallNumber()))
+                        .collect(Collectors.toList()));
+            }
+            break;
+        default:
+            chosen.addAll(allColumns);
+            break;
+        }
+        if (chosen.isEmpty()) {
+            chosen.add(predicateColumn);
+        }
+        return new ArrayList<>(chosen);
+    }
+
+    private String unquoteLiteral(String literal) {
+        if (literal == null || literal.length() < 2) {
+            return literal == null ? "" : literal;
+        }
+        if ((literal.startsWith("'") && literal.endsWith("'"))
+                || (literal.startsWith("\"") && literal.endsWith("\""))) {
+            return literal.substring(1, literal.length() - 1);
+        }
+        return literal;
     }
 
     private QuerySnapshot executeSnapshot(String label, QuerySpec query, List<MySQLColumn> numericCols,
@@ -430,7 +583,7 @@ public class MySQLSubsetOracle3 implements TestOracle<MySQLGlobalState> {
                     if (col.getName().equals(skewProfile.predicateColumn.getName())) {
                         values.add(skewProfile.primaryHotValue);
                     } else {
-                        values.add(generateValue(col, gen, skewProfile, 0.5));
+                        values.add(generateValue(col, gen, skewProfile, 0.5, DistributionStage.BASELINE));
                     }
                 }
                 executeInsert(table, values);
@@ -440,13 +593,14 @@ public class MySQLSubsetOracle3 implements TestOracle<MySQLGlobalState> {
         }
     }
 
-    private void appendSkewedRows(MySQLTable table, SkewProfile skewProfile, int nrRows, double hotspotProbability) {
+    private void appendSkewedRows(MySQLTable table, SkewProfile skewProfile, int nrRows, double hotspotProbability,
+            DistributionStage stage) {
         List<MySQLColumn> cols = table.getColumns();
         for (int i = 0; i < nrRows; i++) {
             try {
                 MySQLExpressionGenerator gen = new MySQLExpressionGenerator(state).setColumns(cols);
                 List<String> values = cols.stream()
-                        .map(c -> generateValue(c, gen, skewProfile, hotspotProbability))
+                        .map(c -> generateValue(c, gen, skewProfile, hotspotProbability, stage))
                         .collect(Collectors.toList());
                 executeInsert(table, values);
             } catch (Throwable e) {
@@ -565,8 +719,13 @@ public class MySQLSubsetOracle3 implements TestOracle<MySQLGlobalState> {
         for (MySQLColumn col : table.getColumns()) {
             hotValuesByColumn.put(col.getName(), createHotValues(col));
         }
-        String primaryHotValue = hotValuesByColumn.get(predicateColumn.getName()).get(0);
-        return new SkewProfile(predicateColumn, primaryHotValue, hotValuesByColumn);
+        List<String> predicateHotValues = hotValuesByColumn.get(predicateColumn.getName());
+        String primaryHotValue = predicateHotValues.get(0);
+        String secondaryHotValue = predicateHotValues.size() > 1 ? predicateHotValues.get(1) : primaryHotValue;
+        String tertiaryHotValue = predicateHotValues.size() > 2 ? predicateHotValues.get(2) : secondaryHotValue;
+        PredicateShiftMode shiftMode = Randomly.fromOptions(PredicateShiftMode.values());
+        return new SkewProfile(predicateColumn, primaryHotValue, secondaryHotValue, tertiaryHotValue, shiftMode,
+                hotValuesByColumn);
     }
 
     private List<String> createHotValues(MySQLColumn col) {
@@ -617,7 +776,7 @@ public class MySQLSubsetOracle3 implements TestOracle<MySQLGlobalState> {
         return Randomly.fromList(table.getColumns());
     }
 
-    private void ensureSupportingIndex(MySQLTable table, MySQLColumn predicateColumn, int id) {
+    private void ensureSupportingIndexes(MySQLTable table, MySQLColumn predicateColumn, int id) {
         String indexName = "i_subset3_" + id;
         String createIndexSql = "CREATE INDEX " + indexName + " ON " + table.getName()
                 + " (`" + predicateColumn.getName() + "`)";
@@ -633,15 +792,114 @@ public class MySQLSubsetOracle3 implements TestOracle<MySQLGlobalState> {
         } catch (Throwable e) {
             log("  Supporting index creation skipped: " + e.getClass().getSimpleName() + ": " + e.getMessage());
         }
+
+        List<MySQLColumn> secondaryCandidates = table.getColumns().stream()
+                .filter(c -> !c.equals(predicateColumn))
+                .collect(Collectors.toList());
+        if (secondaryCandidates.isEmpty() || Randomly.getBooleanWithSmallProbability()) {
+            return;
+        }
+        MySQLColumn secondaryColumn = Randomly.fromList(secondaryCandidates);
+        String compositeIndexName = "i_subset3_c_" + id;
+        String compositeIndexSql;
+        if (Randomly.getBoolean()) {
+            compositeIndexSql = "CREATE INDEX " + compositeIndexName + " ON " + table.getName()
+                    + " (`" + predicateColumn.getName() + "`, `" + secondaryColumn.getName() + "`)";
+        } else {
+            compositeIndexSql = "CREATE INDEX " + compositeIndexName + " ON " + table.getName()
+                    + " (`" + secondaryColumn.getName() + "`, `" + predicateColumn.getName() + "`)";
+        }
+        logSQL(compositeIndexSql);
+        try {
+            state.executeStatement(new SQLQueryAdapter(compositeIndexSql, errors, true));
+        } catch (Throwable e) {
+            log("  Composite supporting index creation skipped: " + e.getClass().getSimpleName()
+                    + ": " + e.getMessage());
+        }
     }
 
     private String generateValue(MySQLColumn col, MySQLExpressionGenerator gen, SkewProfile skewProfile,
-            double hotspotProbability) {
+            double hotspotProbability, DistributionStage stage) {
+        if (col.getName().equals(skewProfile.predicateColumn.getName())) {
+            return generatePredicateValue(gen, skewProfile, stage);
+        }
         List<String> hotValues = skewProfile.hotValuesByColumn.get(col.getName());
         if (hotValues != null && Randomly.getPercentage() < hotspotProbability) {
             return Randomly.fromList(hotValues);
         }
         return MySQLVisitor.asString(gen.generateConstant());
+    }
+
+    private String generatePredicateValue(MySQLExpressionGenerator gen, SkewProfile skewProfile, DistributionStage stage) {
+        double p = Randomly.getPercentage();
+        if (stage == DistributionStage.BASELINE) {
+            if (p < 0.80) {
+                return skewProfile.primaryHotValue;
+            } else if (p < 0.92) {
+                return skewProfile.secondaryHotValue;
+            } else if (p < 0.97) {
+                return skewProfile.tertiaryHotValue;
+            }
+            return MySQLVisitor.asString(gen.generateConstant());
+        }
+        switch (skewProfile.shiftMode) {
+        case PRIMARY_HEAVY:
+            if (p < 0.55) {
+                return skewProfile.primaryHotValue;
+            } else if (p < 0.80) {
+                return skewProfile.secondaryHotValue;
+            } else if (p < 0.92) {
+                return skewProfile.tertiaryHotValue;
+            } else if (p < 0.97) {
+                return "NULL";
+            }
+            return MySQLVisitor.asString(gen.generateConstant());
+        case PRIMARY_SECONDARY_SPLIT:
+            if (p < 0.35) {
+                return skewProfile.primaryHotValue;
+            } else if (p < 0.70) {
+                return skewProfile.secondaryHotValue;
+            } else if (p < 0.88) {
+                return skewProfile.tertiaryHotValue;
+            } else if (p < 0.95) {
+                return "NULL";
+            }
+            return MySQLVisitor.asString(gen.generateConstant());
+        case SECONDARY_HEAVY:
+            if (p < 0.22) {
+                return skewProfile.primaryHotValue;
+            } else if (p < 0.62) {
+                return skewProfile.secondaryHotValue;
+            } else if (p < 0.84) {
+                return skewProfile.tertiaryHotValue;
+            } else if (p < 0.92) {
+                return "NULL";
+            }
+            return MySQLVisitor.asString(gen.generateConstant());
+        case NULL_HEAVY:
+            if (p < 0.28) {
+                return skewProfile.primaryHotValue;
+            } else if (p < 0.48) {
+                return skewProfile.secondaryHotValue;
+            } else if (p < 0.62) {
+                return skewProfile.tertiaryHotValue;
+            } else if (p < 0.84) {
+                return "NULL";
+            }
+            return MySQLVisitor.asString(gen.generateConstant());
+        case NOISE_HEAVY:
+        default:
+            if (p < 0.22) {
+                return skewProfile.primaryHotValue;
+            } else if (p < 0.36) {
+                return skewProfile.secondaryHotValue;
+            } else if (p < 0.46) {
+                return skewProfile.tertiaryHotValue;
+            } else if (p < 0.54) {
+                return "NULL";
+            }
+            return MySQLVisitor.asString(gen.generateConstant());
+        }
     }
 
     private void executeInsert(MySQLTable table, List<String> values) throws Exception {
