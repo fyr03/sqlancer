@@ -7,6 +7,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -47,7 +48,7 @@ public class MariaDBSubsetOracle3 implements TestOracle<MariaDBGlobalState> {
     private static final int BASELINE_RANDOM_ROWS = 4;
     private static final int BASELINE_HOT_ROWS = 2;
     private static final int BASELINE_NOISE_ROWS = 4;
-    private static final int SKEWED_EXPANSION_ROWS = 5000;
+    private static final int SKEWED_EXPANSION_ROWS = 480;
 
     private final MariaDBGlobalState state;
     private final ExpectedErrors insertErrors;
@@ -655,23 +656,31 @@ public class MariaDBSubsetOracle3 implements TestOracle<MariaDBGlobalState> {
         List<String> hotValues = new ArrayList<>();
         switch (col.getType()) {
         case INT:
-            hotValues.add("0");
-            hotValues.add("1");
-            hotValues.add("7");
+            int intAnchor = state.getRandomly().getInteger(-16, 17);
+            hotValues.add(String.valueOf(intAnchor));
+            hotValues.add(String.valueOf(intAnchor + 1 + Randomly.smallNumber()));
+            hotValues.add(String.valueOf(intAnchor - 1 - Randomly.smallNumber()));
             break;
         case VARCHAR:
-            hotValues.add("'hot'");
-            hotValues.add("'skew'");
-            hotValues.add("'bias'");
+            String stringStem = "hv_" + Math.abs(state.getRandomly().getInteger());
+            hotValues.add(quoteStringLiteral(stringStem));
+            hotValues.add(quoteStringLiteral(stringStem + "_a"));
+            hotValues.add(quoteStringLiteral(stringStem + "_b"));
             break;
         case REAL:
-            hotValues.add("0.0");
-            hotValues.add("1.0");
-            hotValues.add("3.14");
+            double realAnchor = state.getRandomly().getInteger(-200, 201) / 10.0;
+            hotValues.add(formatRealHotValue(realAnchor));
+            hotValues.add(formatRealHotValue(realAnchor + 1.0 + Randomly.smallNumber()));
+            hotValues.add(formatRealHotValue(realAnchor - 1.0 - Randomly.smallNumber()));
             break;
         case BOOLEAN:
-            hotValues.add("TRUE");
-            hotValues.add("FALSE");
+            if (Randomly.getBoolean()) {
+                hotValues.add("TRUE");
+                hotValues.add("FALSE");
+            } else {
+                hotValues.add("FALSE");
+                hotValues.add("TRUE");
+            }
             hotValues.add("NULL");
             break;
         default:
@@ -679,6 +688,15 @@ public class MariaDBSubsetOracle3 implements TestOracle<MariaDBGlobalState> {
             break;
         }
         return hotValues;
+    }
+
+    private String formatRealHotValue(double value) {
+        return String.format(Locale.US, "%.3f", value);
+    }
+
+    private String quoteStringLiteral(String value) {
+        String escaped = value.replace("\\", "\\\\").replace("'", "''");
+        return "'" + escaped + "'";
     }
 
     private MariaDBColumn choosePredicateColumn(MariaDBTable table) {
