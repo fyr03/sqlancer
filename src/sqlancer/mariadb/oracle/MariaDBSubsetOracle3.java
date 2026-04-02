@@ -48,7 +48,8 @@ public class MariaDBSubsetOracle3 implements TestOracle<MariaDBGlobalState> {
     private static final int BASELINE_RANDOM_ROWS = 4;
     private static final int BASELINE_HOT_ROWS = 2;
     private static final int BASELINE_NOISE_ROWS = 4;
-    private static final int SKEWED_EXPANSION_ROWS = 480;
+    private static final int SKEWED_EXPANSION_ROWS = 2000;
+    private static final double UNCHANGED_PLAN_VERIFICATION_PROBABILITY = 0.15;
 
     private final MariaDBGlobalState state;
     private final ExpectedErrors insertErrors;
@@ -239,11 +240,20 @@ public class MariaDBSubsetOracle3 implements TestOracle<MariaDBGlobalState> {
             for (int i = 0; i < baselines.size(); i++) {
                 BaselinePhase baseline = baselines.get(i);
                 log("  Query[" + (i + 1) + "]: " + baseline.query.selectQuery);
-                QuerySnapshot s2Snapshot = executeSnapshot("S2", baseline.query, numericCols, false);
+                List<String> s2Plan = captureExplainPlan(baseline.query.selectQuery);
+                logPlan("Plan2[" + (i + 1) + "]", s2Plan);
+                boolean planChanged = !plansEquivalentStructurally(baseline.snapshot.plan, s2Plan);
+                log("  Plan changed after ANALYZE TABLE [" + (i + 1) + "]: " + planChanged);
+                if (!planChanged) {
+                    boolean sampled = Randomly.getPercentage() < UNCHANGED_PLAN_VERIFICATION_PROBABILITY;
+                    log("  Plan unchanged sampling decision [" + (i + 1) + "]: "
+                            + (sampled ? "verify" : "skip"));
+                    if (!sampled) {
+                        continue;
+                    }
+                }
+                QuerySnapshot s2Snapshot = executeSnapshot("S2", baseline.query, numericCols, false, s2Plan);
                 log("  S2 count[" + (i + 1) + "]: " + s2Snapshot.count);
-                logPlan("Plan2[" + (i + 1) + "]", s2Snapshot.plan);
-                log("  Plan changed after ANALYZE TABLE [" + (i + 1) + "]: "
-                        + !baseline.snapshot.plan.equals(s2Snapshot.plan));
 
                 log("\n[Step 6." + (i + 1) + "] Checking monotonicity across S1/S2...");
                 verifyCount(baseline.query, baseline.snapshot, s2Snapshot);
@@ -418,6 +428,11 @@ public class MariaDBSubsetOracle3 implements TestOracle<MariaDBGlobalState> {
 
     private QuerySnapshot executeSnapshot(String label, QuerySpec query, List<MariaDBColumn> numericCols,
             boolean captureRows) throws Exception {
+        return executeSnapshot(label, query, numericCols, captureRows, null);
+    }
+
+    private QuerySnapshot executeSnapshot(String label, QuerySpec query, List<MariaDBColumn> numericCols,
+            boolean captureRows, List<String> precomputedPlan) throws Exception {
         Long count = executeSingleLong(query.getCountQuery());
         Set<String> rowDigests = captureRows ? executeAndGetRowDigests(query.selectQuery, query.resultColumns) : null;
         Map<String, Double> maxValues = new LinkedHashMap<>();
@@ -426,7 +441,7 @@ public class MariaDBSubsetOracle3 implements TestOracle<MariaDBGlobalState> {
             maxValues.put(col.getName(), executeSingleDouble(query.getMaxQuery(col.getName())));
             minValues.put(col.getName(), executeSingleDouble(query.getMinQuery(col.getName())));
         }
-        List<String> plan = captureExplainPlan(query.selectQuery);
+        List<String> plan = precomputedPlan != null ? precomputedPlan : captureExplainPlan(query.selectQuery);
         if (rowDigests != null) {
             log("  " + label + " result rows: " + rowDigests.size());
         }
@@ -572,6 +587,32 @@ public class MariaDBSubsetOracle3 implements TestOracle<MariaDBGlobalState> {
         } finally {
             rs.close();
         }
+    }
+
+    private boolean plansEquivalentStructurally(List<String> left, List<String> right) {
+        if (left == null || right == null) {
+            return left == right;
+        }
+        if (left.size() != right.size()) {
+            return false;
+        }
+        for (int i = 0; i < left.size(); i++) {
+            if (!normalizePlanRow(left.get(i)).equals(normalizePlanRow(right.get(i)))) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private String normalizePlanRow(String row) {
+        if (row == null) {
+            return "null";
+        }
+        String normalized = row.replaceAll("cost=[^ )]+", "cost=?")
+                .replaceAll("rows=[^ )]+", "rows=?")
+                .replaceAll("\\s+", " ")
+                .trim();
+        return normalized;
     }
 
     private void insertNoiseRows(MariaDBTable table, int nrRows) {

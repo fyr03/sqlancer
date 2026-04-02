@@ -66,7 +66,7 @@ nohup java \
 ## Oracle3 run
 ```
 nohup java \
-  -Xmx8g -Xms8g \
+  -Xmx31g -Xms31g \
   -XX:+HeapDumpOnOutOfMemoryError \
   -XX:HeapDumpPath=logs/oom_dump.hprof \
   -Dsqlancer.subset.verbose=false \
@@ -140,7 +140,7 @@ python mariadb_replay.py \
 ## Run oracle3
 ```
 nohup java \
-  -Xmx8g -Xms8g \
+  -Xmx31g -Xms31g \
   -XX:+HeapDumpOnOutOfMemoryError \
   -XX:HeapDumpPath=logs/oom_dump.hprof \
   -Dsqlancer.subset.verbose=false \

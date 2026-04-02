@@ -56,7 +56,8 @@ public class MySQLSubsetOracle3 implements TestOracle<MySQLGlobalState> {
     private static final int BASELINE_RANDOM_ROWS = 4;
     private static final int BASELINE_HOT_ROWS = 2;
     private static final int BASELINE_NOISE_ROWS = 4;
-    private static final int SKEWED_EXPANSION_ROWS = 480;
+    private static final int SKEWED_EXPANSION_ROWS = 2000;
+    private static final double UNCHANGED_PLAN_VERIFICATION_PROBABILITY = 0.15;
 
     private final MySQLGlobalState state;
     private final ExpectedErrors insertErrors;
@@ -252,11 +253,20 @@ public class MySQLSubsetOracle3 implements TestOracle<MySQLGlobalState> {
             for (int i = 0; i < baselines.size(); i++) {
                 BaselinePhase baseline = baselines.get(i);
                 log("  Query[" + (i + 1) + "]: " + baseline.query.selectQuery);
-                QuerySnapshot s2Snapshot = executeSnapshot("S2", baseline.query, numericCols, false);
+                List<String> s2Plan = captureExplainPlan(baseline.query.selectQuery);
+                logPlan("Plan2[" + (i + 1) + "]", s2Plan);
+                boolean planChanged = !plansEquivalentStructurally(baseline.snapshot.plan, s2Plan);
+                log("  Plan changed after ANALYZE TABLE [" + (i + 1) + "]: " + planChanged);
+                if (!planChanged) {
+                    boolean sampled = Randomly.getPercentage() < UNCHANGED_PLAN_VERIFICATION_PROBABILITY;
+                    log("  Plan unchanged sampling decision [" + (i + 1) + "]: "
+                            + (sampled ? "verify" : "skip"));
+                    if (!sampled) {
+                        continue;
+                    }
+                }
+                QuerySnapshot s2Snapshot = executeSnapshot("S2", baseline.query, numericCols, false, s2Plan);
                 log("  S2 count[" + (i + 1) + "]: " + s2Snapshot.count);
-                logPlan("Plan2[" + (i + 1) + "]", s2Snapshot.plan);
-                log("  Plan changed after ANALYZE TABLE [" + (i + 1) + "]: "
-                        + !baseline.snapshot.plan.equals(s2Snapshot.plan));
                 suppressKnownReportedBug(table, baseline.query, baseline.snapshot, s2Snapshot);
 
             log("\n[Step 6] Checking monotonicity across S1 ⊆ S2...");
@@ -439,6 +449,11 @@ public class MySQLSubsetOracle3 implements TestOracle<MySQLGlobalState> {
 
     private QuerySnapshot executeSnapshot(String label, QuerySpec query, List<MySQLColumn> numericCols,
             boolean captureRows) throws Exception {
+        return executeSnapshot(label, query, numericCols, captureRows, null);
+    }
+
+    private QuerySnapshot executeSnapshot(String label, QuerySpec query, List<MySQLColumn> numericCols,
+            boolean captureRows, List<String> precomputedPlan) throws Exception {
         Long count = executeSingleLong(query.getCountQuery());
         Set<String> rowDigests = captureRows ? executeAndGetRowDigests(query.selectQuery, query.resultColumns) : null;
         Map<String, Double> maxValues = new LinkedHashMap<>();
@@ -447,7 +462,7 @@ public class MySQLSubsetOracle3 implements TestOracle<MySQLGlobalState> {
             maxValues.put(col.getName(), executeSingleDouble(query.getMaxQuery(col.getName())));
             minValues.put(col.getName(), executeSingleDouble(query.getMinQuery(col.getName())));
         }
-        List<String> plan = captureExplainPlan(query.selectQuery);
+        List<String> plan = precomputedPlan != null ? precomputedPlan : captureExplainPlan(query.selectQuery);
         if (rowDigests != null) {
             log("  " + label + " result rows: " + rowDigests.size());
         }
@@ -459,50 +474,72 @@ public class MySQLSubsetOracle3 implements TestOracle<MySQLGlobalState> {
         if (!SUPPRESS_KNOWN_FLOAT_ZERO_MAX_NULL_BUG) {
             return;
         }
-        if (!isKnownFloatZeroMaxNullBugCandidate(query, s1, s2)) {
+        String floatingPredicateDescription = extractFloatingPredicateDescription(query);
+        if (floatingPredicateDescription == null) {
             return;
         }
-        Double ignoreIndexMax = executeSingleDouble(buildIgnoreIndexMaxQuery(table, query));
-        if (ignoreIndexMax == null || Math.abs(ignoreIndexMax) > 1e-9) {
+        String affectedColumn = findKnownFloatMaxNullBugColumn(table, query, s1, s2);
+        if (affectedColumn == null) {
             return;
         }
-        log("  Known reported MySQL bug pattern detected (FLOAT/DOUBLE `= 0.0` index path leaks NULL).");
+        log("  Known reported MySQL bug pattern detected (FLOAT/DOUBLE range/equality index path leaks NULL MAX).");
+        log("  Floating predicate: " + floatingPredicateDescription + ", affected column: " + affectedColumn);
         log("  Suppressing this round so Oracle3 can continue searching for new bugs.");
         throw new IgnoreMeException();
     }
 
-    private boolean isKnownFloatZeroMaxNullBugCandidate(QuerySpec query, QuerySnapshot s1, QuerySnapshot s2) {
+    private String extractFloatingPredicateDescription(QuerySpec query) {
         if (query.predicateColumn == null || !isFloatingPointColumn(query.predicateColumn)) {
-            return false;
+            return null;
         }
-        String expectedWhere = " WHERE `" + query.predicateColumn.getName() + "` = 0.0";
-        if (!expectedWhere.equals(query.whereClause)) {
-            return false;
+        String prefix = " WHERE `" + query.predicateColumn.getName() + "` ";
+        if (!query.whereClause.startsWith(prefix)) {
+            return null;
         }
-        if (s1.count == null || s1.count <= 0 || s2.count == null || s2.count <= 0) {
-            return false;
+        String predicate = query.whereClause.substring(prefix.length()).trim();
+        if (predicate.isEmpty() || "IS NULL".equalsIgnoreCase(predicate)) {
+            return null;
         }
-        Double s1Max = s1.maxValues.get(query.predicateColumn.getName());
-        Double s2Max = s2.maxValues.get(query.predicateColumn.getName());
-        Double s2Min = s2.minValues.get(query.predicateColumn.getName());
-        return s1Max != null
-                && Math.abs(s1Max) <= 1e-9
-                && s2Max == null
-                && s2Min != null
-                && Math.abs(s2Min) <= 1e-9;
+        if (predicate.startsWith("=") || predicate.startsWith("IN (") || predicate.startsWith("BETWEEN ")
+                || predicate.startsWith("<=") || predicate.startsWith(">=")) {
+            return predicate;
+        }
+        return null;
     }
 
-    private String buildIgnoreIndexMaxQuery(MySQLTable table, QuerySpec query) {
+    private String findKnownFloatMaxNullBugColumn(MySQLTable table, QuerySpec query, QuerySnapshot s1, QuerySnapshot s2)
+            throws SQLException {
+        if (s1.count == null || s1.count <= 0 || s2.count == null || s2.count <= 0) {
+            return null;
+        }
         MySQLTable currentTable = findTable(query.tableName);
         MySQLTable tableWithFreshIndexes = currentTable != null ? currentTable : table;
-        String ignoreIndexClause = tableWithFreshIndexes.getIndexes().stream()
+        for (MySQLColumn col : tableWithFreshIndexes.getColumns()) {
+            if (!isFloatingPointColumn(col)) {
+                continue;
+            }
+            Double s1Max = s1.maxValues.get(col.getName());
+            Double s2Max = s2.maxValues.get(col.getName());
+            if (s1Max == null || s2Max != null) {
+                continue;
+            }
+            Double ignoreIndexMax = executeSingleDouble(buildIgnoreIndexAggregateQuery(tableWithFreshIndexes, query,
+                    "MAX", col.getName()));
+            if (ignoreIndexMax != null && ignoreIndexMax + 1e-9 >= s1Max) {
+                return col.getName();
+            }
+        }
+        return null;
+    }
+
+    private String buildIgnoreIndexAggregateQuery(MySQLTable table, QuerySpec query, String aggregate, String column) {
+        String ignoreIndexClause = table.getIndexes().stream()
                 .map(idx -> idx.getIndexName())
-                .filter(idx -> !"`PRIMARY`".equalsIgnoreCase(idx) && !"PRIMARY".equalsIgnoreCase(idx))
                 .collect(Collectors.joining(", "));
         if (ignoreIndexClause.isEmpty()) {
-            return query.getMaxQuery(query.predicateColumn.getName());
+            return "SELECT " + aggregate + "(`" + column + "`) FROM " + query.tableName + query.whereClause;
         }
-        return "SELECT MAX(`" + query.predicateColumn.getName() + "`) FROM " + query.tableName
+        return "SELECT " + aggregate + "(`" + column + "`) FROM " + query.tableName
                 + " IGNORE INDEX (" + ignoreIndexClause + ")" + query.whereClause;
     }
 
@@ -644,6 +681,32 @@ public class MySQLSubsetOracle3 implements TestOracle<MySQLGlobalState> {
         } finally {
             rs.close();
         }
+    }
+
+    private boolean plansEquivalentStructurally(List<String> left, List<String> right) {
+        if (left == null || right == null) {
+            return left == right;
+        }
+        if (left.size() != right.size()) {
+            return false;
+        }
+        for (int i = 0; i < left.size(); i++) {
+            if (!normalizePlanRow(left.get(i)).equals(normalizePlanRow(right.get(i)))) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private String normalizePlanRow(String row) {
+        if (row == null) {
+            return "null";
+        }
+        String normalized = row.replaceAll("cost=[^ )]+", "cost=?")
+                .replaceAll("rows=[^ )]+", "rows=?")
+                .replaceAll("\\s+", " ")
+                .trim();
+        return normalized;
     }
 
     private void insertNoiseRows(MySQLTable table, int nrRows) {
