@@ -12,6 +12,8 @@ import sqlancer.SQLConnection;
 
 public class SQLQueryAdapter extends Query<SQLConnection> implements Serializable {
     private static final long serialVersionUID = 1L;
+    private static final int DEFAULT_STATEMENT_TIMEOUT_SECONDS =
+            Integer.getInteger("sqlancer.jdbc.queryTimeoutSeconds", 600);
 
     private final String query;
     private final ExpectedErrors expectedErrors;
@@ -133,6 +135,7 @@ public class SQLQueryAdapter extends Query<SQLConnection> implements Serializabl
         } else {
             s = connection.createStatement();
         }
+        applyStatementTimeout(s);
         try {
             if (fills.length > 0) {
                 ((PreparedStatement) s).execute();
@@ -188,6 +191,7 @@ public class SQLQueryAdapter extends Query<SQLConnection> implements Serializabl
         } else {
             s = connection.createStatement();
         }
+        applyStatementTimeout(s);
         ResultSet result;
         try {
             if (fills.length > 0) {
@@ -207,6 +211,12 @@ public class SQLQueryAdapter extends Query<SQLConnection> implements Serializabl
                 checkException(e);
             }
             return null;
+        }
+    }
+
+    private void applyStatementTimeout(Statement s) throws SQLException {
+        if (DEFAULT_STATEMENT_TIMEOUT_SECONDS > 0) {
+            s.setQueryTimeout(DEFAULT_STATEMENT_TIMEOUT_SECONDS);
         }
     }
 

@@ -3,6 +3,7 @@ package sqlancer.mariadb.oracle;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.sql.SQLException;
+import java.sql.Statement;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
@@ -180,7 +181,6 @@ public class MariaDBSubsetOracle3 implements TestOracle<MariaDBGlobalState> {
             } while (createTable.getQueryString().toUpperCase().contains(" LIKE "));
             logSQL(createTable.getQueryString());
             state.executeStatement(createTable);
-            state.updateSchema();
 
             MariaDBTable table = findTable(tableName);
             if (table == null) {
@@ -761,15 +761,9 @@ public class MariaDBSubsetOracle3 implements TestOracle<MariaDBGlobalState> {
         String indexName = "i_subset3_" + id;
         String createIndexSql = "CREATE INDEX " + indexName + " ON " + table.getName()
                 + " (`" + predicateColumn.getName() + "`)";
-        ExpectedErrors errors = new ExpectedErrors();
-        MariaDBErrors.addCommonErrors(errors);
-        errors.add("Duplicate key name");
-        errors.add("Specified key was too long");
-        errors.add("used in key specification without a key length");
-        errors.add("Data truncation");
         logSQL(createIndexSql);
         try {
-            state.executeStatement(new SQLQueryAdapter(createIndexSql, errors, true));
+            executeInternalDDL(createIndexSql);
         } catch (Throwable e) {
             log("  Supporting index creation skipped: " + e.getClass().getSimpleName() + ": " + e.getMessage());
         }
@@ -792,7 +786,7 @@ public class MariaDBSubsetOracle3 implements TestOracle<MariaDBGlobalState> {
         }
         logSQL(compositeIndexSql);
         try {
-            state.executeStatement(new SQLQueryAdapter(compositeIndexSql, errors, true));
+            executeInternalDDL(compositeIndexSql);
         } catch (Throwable e) {
             log("  Composite supporting index creation skipped: " + e.getClass().getSimpleName()
                     + ": " + e.getMessage());
@@ -905,8 +899,19 @@ public class MariaDBSubsetOracle3 implements TestOracle<MariaDBGlobalState> {
 
     private void dropIfExists(String tableName) {
         try {
-            state.executeStatement(new SQLQueryAdapter("DROP TABLE IF EXISTS " + tableName, true));
+            executeInternalDDL("DROP TABLE IF EXISTS " + tableName);
         } catch (Exception ignored) {
+        }
+    }
+
+    private void executeInternalDDL(String sql) throws SQLException {
+        state.getState().logStatement(sql);
+        try (Statement s = state.getConnection().createStatement()) {
+            int timeoutSeconds = Integer.getInteger("sqlancer.jdbc.queryTimeoutSeconds", 600);
+            if (timeoutSeconds > 0) {
+                s.setQueryTimeout(timeoutSeconds);
+            }
+            s.execute(sql);
         }
     }
 

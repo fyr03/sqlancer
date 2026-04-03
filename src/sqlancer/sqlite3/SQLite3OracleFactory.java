@@ -14,6 +14,7 @@ import sqlancer.sqlite3.gen.SQLite3ExpressionGenerator;
 import sqlancer.sqlite3.oracle.SQLite3CODDTestOracle;
 import sqlancer.sqlite3.oracle.SQLite3Fuzzer;
 import sqlancer.sqlite3.oracle.SQLite3PivotedQuerySynthesisOracle;
+import sqlancer.sqlite3.oracle.SQLite3SubsetOracle3;
 import sqlancer.sqlite3.oracle.tlp.SQLite3TLPAggregateOracle;
 import sqlancer.sqlite3.oracle.tlp.SQLite3TLPDistinctOracle;
 import sqlancer.sqlite3.oracle.tlp.SQLite3TLPGroupByOracle;
@@ -84,6 +85,12 @@ public enum SQLite3OracleFactory implements OracleFactory<SQLite3GlobalState> {
         @Override
         public TestOracle<SQLite3GlobalState> create(SQLite3GlobalState globalState) throws SQLException {
             return new SQLite3Fuzzer(globalState);
+        }
+    },
+    SUBSET3 {
+        @Override
+        public TestOracle<SQLite3GlobalState> create(SQLite3GlobalState globalState) throws SQLException {
+            return new SQLite3SubsetOracle3(globalState);
         }
     },
     QUERY_PARTITIONING {

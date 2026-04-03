@@ -154,3 +154,53 @@ nohup java \
   mariadb --oracle SUBSET3 \
   > logs/mariadb_run.log 2>&1 &
 ```
+
+# Sqlite
+
+## Test oracle3
+```
+nohup java \
+  -Xmx31g -Xms31g \
+  -XX:+HeapDumpOnOutOfMemoryError \
+  -XX:HeapDumpPath=logs/oom_dump.hprof \
+  -Dsqlancer.subset.verbose=true \
+  -jar target/sqlancer-2.0.0.jar \
+  --num-threads 4 \
+  --num-queries 10000000 \
+  --num-tries 1 \
+  --max-generated-databases 10000000 \
+  --timeout-seconds 86400 \
+  sqlite3 --oracle SUBSET3 \
+  > logs/sqlite_run.log 2>&1 &
+```
+## Get bug report
+```
+python3 list_bugs_3.py ./logs/sqlite3 --save logs/sqlite_bug_list.txt
+```
+## Replay oracle3
+```
+python sqlite_replay.py \
+    --input  replay_input.log \
+    --output replay_output.log \
+    --database replay.sqlite
+```
+## Backup logs
+```
+./sqlite3_backup_logs.sh
+```
+## Run oracle3
+```
+nohup java \
+  -Xmx31g -Xms31g \
+  -XX:+HeapDumpOnOutOfMemoryError \
+  -XX:HeapDumpPath=logs/oom_dump.hprof \
+  -Dsqlancer.subset.verbose=false \
+  -jar target/sqlancer-2.0.0.jar \
+  --num-threads 4 \
+  --num-queries 10000000 \
+  --num-tries 10 \
+  --max-generated-databases 10000000 \
+  --timeout-seconds 86400 \
+  sqlite3 --oracle SUBSET3 \
+  > logs/sqlite_run.log 2>&1 &
+```

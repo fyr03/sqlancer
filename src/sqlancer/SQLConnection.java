@@ -7,6 +7,9 @@ import java.sql.Statement;
 
 public class SQLConnection implements SQLancerDBConnection {
 
+    private static final int DEFAULT_STATEMENT_TIMEOUT_SECONDS =
+            Integer.getInteger("sqlancer.jdbc.queryTimeoutSeconds", 600);
+
     private final Connection connection;
 
     public SQLConnection(Connection connection) {
@@ -25,10 +28,20 @@ public class SQLConnection implements SQLancerDBConnection {
     }
 
     public Statement prepareStatement(String arg) throws SQLException {
-        return connection.prepareStatement(arg);
+        Statement s = connection.prepareStatement(arg);
+        applyStatementTimeout(s);
+        return s;
     }
 
     public Statement createStatement() throws SQLException {
-        return connection.createStatement();
+        Statement s = connection.createStatement();
+        applyStatementTimeout(s);
+        return s;
+    }
+
+    private void applyStatementTimeout(Statement s) throws SQLException {
+        if (DEFAULT_STATEMENT_TIMEOUT_SECONDS > 0) {
+            s.setQueryTimeout(DEFAULT_STATEMENT_TIMEOUT_SECONDS);
+        }
     }
 }

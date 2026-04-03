@@ -30,6 +30,10 @@ import sqlancer.mariadb.gen.MariaDBUpdateGenerator;
 
 @AutoService(DatabaseProvider.class)
 public class MariaDBProvider extends SQLProviderAdapter<MariaDBGlobalState, MariaDBOptions> {
+    private static final int DEFAULT_CONNECT_TIMEOUT_MS =
+            Integer.getInteger("sqlancer.jdbc.connectTimeoutMs", 15000);
+    private static final int DEFAULT_SOCKET_TIMEOUT_MS =
+            Integer.getInteger("sqlancer.jdbc.socketTimeoutMs", 600000);
 
     public static final int MAX_EXPRESSION_DEPTH = 3;
 
@@ -189,7 +193,8 @@ public class MariaDBProvider extends SQLProviderAdapter<MariaDBGlobalState, Mari
         if (port == MainOptions.NO_SET_PORT) {
             port = MariaDBOptions.DEFAULT_PORT;
         }
-        String url = String.format("jdbc:mariadb://%s:%d", host, port);
+        String url = String.format("jdbc:mariadb://%s:%d?connectTimeout=%d&socketTimeout=%d&tcpKeepAlive=true",
+                host, port, DEFAULT_CONNECT_TIMEOUT_MS, DEFAULT_SOCKET_TIMEOUT_MS);
         Connection con = DriverManager.getConnection(url, username, password);
         try (Statement s = con.createStatement()) {
             s.execute("DROP DATABASE IF EXISTS " + globalState.getDatabaseName());
