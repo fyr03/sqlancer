@@ -140,6 +140,11 @@ public class SQLite3SubsetOracle3 implements TestOracle<SQLite3GlobalState> {
         NON_PREDICATE_FOCUS
     }
 
+    @FunctionalInterface
+    private interface ThrowingRunnable {
+        void run() throws Exception;
+    }
+
     public SQLite3SubsetOracle3(SQLite3GlobalState state) {
         this.state = state;
         this.insertErrors = new ExpectedErrors();
@@ -183,12 +188,14 @@ public class SQLite3SubsetOracle3 implements TestOracle<SQLite3GlobalState> {
             log("  Biased predicate column: " + predicateColumn.getName()
                     + " with hot value " + skewProfile.primaryHotValue);
 
-            log("\n[Step 2] Building baseline state S1 with append-only inserts...");
-            appendHotSeedRows(table, skewProfile, BASELINE_HOT_ROWS);
-            appendSkewedRows(table, skewProfile, BASELINE_RANDOM_ROWS + Randomly.smallNumber(), 0.35,
-                    DistributionStage.BASELINE);
-            log("  Inserting a few boundary/null seed rows into S1...");
-            insertNoiseRows(table, BASELINE_NOISE_ROWS);
+            log("\n[Step 2] Building baseline state S1 with append-only inserts inside one transaction...");
+            executeWriteTransaction(() -> {
+                appendHotSeedRows(table, skewProfile, BASELINE_HOT_ROWS);
+                appendSkewedRows(table, skewProfile, BASELINE_RANDOM_ROWS + Randomly.smallNumber(), 0.35,
+                        DistributionStage.BASELINE);
+                log("  Inserting a few boundary/null seed rows into S1...");
+                insertNoiseRows(table, BASELINE_NOISE_ROWS);
+            });
             Long s1TableCount = executeSingleLong("SELECT COUNT(*) FROM " + tableName);
             if (s1TableCount == null || s1TableCount == 0L) {
                 throw new IgnoreMeException();
@@ -204,9 +211,9 @@ public class SQLite3SubsetOracle3 implements TestOracle<SQLite3GlobalState> {
                 logPlan("Plan1[" + (i + 1) + "]", baseline.snapshot.plan);
             }
 
-            log("\n[Step 4] Appending many skewed rows and running ANALYZE...");
-            appendSkewedRows(table, skewProfile, SKEWED_EXPANSION_ROWS + 64 * Randomly.smallNumber(), 0.92,
-                    DistributionStage.EXPANSION);
+            log("\n[Step 4] Appending many skewed rows, COMMIT, and running ANALYZE...");
+            executeWriteTransaction(() -> appendSkewedRows(table, skewProfile,
+                    SKEWED_EXPANSION_ROWS + 64 * Randomly.smallNumber(), 0.92, DistributionStage.EXPANSION));
 
             Long s2TableCount = executeSingleLong("SELECT COUNT(*) FROM " + tableName);
             if (s2TableCount == null || s2TableCount <= s1TableCount) {
@@ -267,7 +274,7 @@ public class SQLite3SubsetOracle3 implements TestOracle<SQLite3GlobalState> {
         int nrPayloadColumns = 2 + Randomly.smallNumber();
         StringBuilder sb = new StringBuilder();
         sb.append("CREATE TABLE ").append(tableName).append(" (");
-        sb.append("id INTEGER PRIMARY KEY AUTOINCREMENT");
+        sb.append("id INTEGER PRIMARY KEY");
         for (int i = 0; i < nrPayloadColumns; i++) {
             sb.append(", c").append(i).append(" ").append(Randomly.fromOptions("INTEGER", "REAL", "TEXT"));
         }
@@ -276,6 +283,38 @@ public class SQLite3SubsetOracle3 implements TestOracle<SQLite3GlobalState> {
         SQLite3Errors.addTableManipulationErrors(errors);
         errors.add("already exists");
         return new SQLQueryAdapter(sb.toString(), errors, true);
+    }
+
+    private void executeWriteTransaction(ThrowingRunnable action) throws Exception {
+        beginWriteTransaction();
+        boolean committed = false;
+        try {
+            action.run();
+            commitTransaction();
+            committed = true;
+        } finally {
+            if (!committed) {
+                rollbackTransactionQuietly();
+            }
+        }
+    }
+
+    private void beginWriteTransaction() throws Exception {
+        logSQL("BEGIN IMMEDIATE");
+        state.executeStatement(new SQLQueryAdapter("BEGIN IMMEDIATE", false));
+    }
+
+    private void commitTransaction() throws Exception {
+        logSQL("COMMIT");
+        state.executeStatement(new SQLQueryAdapter("COMMIT", false));
+    }
+
+    private void rollbackTransactionQuietly() {
+        try {
+            logSQL("ROLLBACK");
+            state.executeStatement(new SQLQueryAdapter("ROLLBACK", false));
+        } catch (Exception ignored) {
+        }
     }
 
     private List<BaselinePhase> createValidatedBaselinePhases(SQLite3Table table, List<SQLite3Column> numericCols,

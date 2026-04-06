@@ -257,6 +257,7 @@ public class MySQLSubsetOracle3 implements TestOracle<MySQLGlobalState> {
                 logPlan("Plan2[" + (i + 1) + "]", s2Plan);
                 boolean planChanged = !plansEquivalentStructurally(baseline.snapshot.plan, s2Plan);
                 log("  Plan changed after ANALYZE TABLE [" + (i + 1) + "]: " + planChanged);
+                logPlanComparison(i + 1, baseline.query.selectQuery, baseline.snapshot.plan, s2Plan, planChanged);
                 if (!planChanged) {
                     boolean sampled = Randomly.getPercentage() < UNCHANGED_PLAN_VERIFICATION_PROBABILITY;
                     log("  Plan unchanged sampling decision [" + (i + 1) + "]: "
@@ -269,7 +270,7 @@ public class MySQLSubsetOracle3 implements TestOracle<MySQLGlobalState> {
                 log("  S2 count[" + (i + 1) + "]: " + s2Snapshot.count);
                 suppressKnownReportedBug(table, baseline.query, baseline.snapshot, s2Snapshot);
 
-            log("\n[Step 6] Checking monotonicity across S1 ⊆ S2...");
+                log("\n[Step 6] Checking monotonicity across S1 ⊆ S2...");
                 log("\n[Step 6." + (i + 1) + "] Checking monotonicity across S1/S2...");
                 verifyCount(baseline.query, baseline.snapshot, s2Snapshot);
                 for (MySQLColumn col : numericCols) {
@@ -677,30 +678,56 @@ public class MySQLSubsetOracle3 implements TestOracle<MySQLGlobalState> {
     }
 
     private List<String> captureExplainPlan(String selectQuery) throws SQLException {
-        String explainQuery = "EXPLAIN " + selectQuery;
+        String explainQuery = "EXPLAIN FORMAT=TRADITIONAL " + selectQuery;
         lastQueryString = explainQuery;
         ExpectedErrors errors = new ExpectedErrors();
         MySQLErrors.addExpressionErrors(errors);
         state.getState().logStatement(explainQuery);
         SQLancerResultSet rs = new SQLQueryAdapter(explainQuery, errors).executeAndGet(state);
         if (rs == null) {
-            throw new SQLException("EXPLAIN failed (null ResultSet): " + explainQuery);
+            throw new SQLException("EXPLAIN returned null: " + explainQuery);
         }
         try {
             List<String> planRows = new ArrayList<>();
             while (rs.next()) {
-                planRows.add(String.format("id=%s;select=%s;table=%s;type=%s;key=%s;rows=%s;extra=%s",
-                        nullToEmpty(getOptionalString(rs, 1)),
-                        nullToEmpty(getOptionalString(rs, 2)),
-                        nullToEmpty(getOptionalString(rs, 3)),
-                        nullToEmpty(getOptionalString(rs, 4)),
-                        nullToEmpty(getOptionalString(rs, 6)),
-                        nullToEmpty(getOptionalString(rs, 10)),
-                        nullToEmpty(getOptionalString(rs, 12))));
+                // 列号修正：4=partitions(跳过), 5=type, 7=key
+                String row = String.format(
+                    "id=%s;select_type=%s;table=%s;type=%s;possible_keys=%s;key=%s;key_len=%s;rows=%s;filtered=%s;extra=%s",
+                    nullToEmpty(getOptionalString(rs, 1)),   // id
+                    nullToEmpty(getOptionalString(rs, 2)),   // select_type
+                    nullToEmpty(getOptionalString(rs, 3)),   // table
+                    nullToEmpty(getOptionalString(rs, 5)),   // type (ALL/index/range/ref...) ← 原来是4，错的
+                    nullToEmpty(getOptionalString(rs, 6)),   // possible_keys
+                    nullToEmpty(getOptionalString(rs, 7)),   // key（实际使用的索引）← 原来是6，错的
+                    nullToEmpty(getOptionalString(rs, 8)),   // key_len
+                    nullToEmpty(getOptionalString(rs, 10)),  // rows
+                    nullToEmpty(getOptionalString(rs, 11)),  // filtered
+                    nullToEmpty(getOptionalString(rs, 12))   // Extra
+                );
+                planRows.add(row);
             }
             return planRows;
         } finally {
             rs.close();
+        }
+    }
+
+    private void logPlanComparison(int index, String query,
+            List<String> plan1, List<String> plan2, boolean changed) {
+        log(String.format("\n  [Plan Diff #%d] planChanged=%s", index, changed));
+        log("  Query: " + query);
+        int maxRows = Math.max(plan1.size(), plan2.size());
+        for (int r = 0; r < maxRows; r++) {
+            String p1row = r < plan1.size() ? plan1.get(r) : "(none)";
+            String p2row = r < plan2.size() ? plan2.get(r) : "(none)";
+            boolean rowDiff = !normalizePlanRow(p1row).equals(normalizePlanRow(p2row));
+            if (rowDiff) {
+                log(String.format("    row[%d] <<< CHANGED >>>", r));
+                log("      S1: " + p1row);
+                log("      S2: " + p2row);
+            } else {
+                log(String.format("    row[%d] same: %s", r, p1row));
+            }
         }
     }
 
@@ -720,14 +747,14 @@ public class MySQLSubsetOracle3 implements TestOracle<MySQLGlobalState> {
     }
 
     private String normalizePlanRow(String row) {
-        if (row == null) {
-            return "null";
-        }
-        String normalized = row.replaceAll("cost=[^ )]+", "cost=?")
-                .replaceAll("rows=[^ )]+", "rows=?")
-                .replaceAll("\\s+", " ")
-                .trim();
-        return normalized;
+        // rows/filtered 随数据量变化，不代表路径切换，抹掉
+        // type 和 key 是路径切换的核心标志，保留
+        return row
+            .replaceAll("rows=[^;]+", "rows=?")
+            .replaceAll("filtered=[^;]+", "filtered=?")
+            .replaceAll("key_len=[^;]+", "key_len=?")
+            .replaceAll("\\s+", " ")
+            .trim();
     }
 
     private void insertNoiseRows(MySQLTable table, int nrRows) {

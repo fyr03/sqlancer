@@ -72,9 +72,9 @@ nohup java \
   -Dsqlancer.subset.verbose=false \
   -jar target/sqlancer-2.0.0.jar \
   --num-threads 4 \
-  --num-queries 10000000 \
-  --num-tries 10 \
-  --max-generated-databases 10000000 \
+  --num-queries 1000000 \
+  --num-tries 40 \
+  --max-generated-databases 1000000 \
   --timeout-seconds 86400 \
   --host 127.0.0.1 --port 3307 \
   mysql --oracle SUBSET3 \
@@ -146,9 +146,9 @@ nohup java \
   -Dsqlancer.subset.verbose=false \
   -jar target/sqlancer-2.0.0.jar \
   --num-threads 4 \
-  --num-queries 10000000 \
-  --num-tries 10 \
-  --max-generated-databases 10000000 \
+  --num-queries 1000000 \
+  --num-tries 40 \
+  --max-generated-databases 1000000 \
   --timeout-seconds 86400 \
   --host 127.0.0.1 --port 3309 \
   mariadb --oracle SUBSET3 \
@@ -197,9 +197,9 @@ nohup java \
   -Dsqlancer.subset.verbose=false \
   -jar target/sqlancer-2.0.0.jar \
   --num-threads 4 \
-  --num-queries 10000000 \
-  --num-tries 10 \
-  --max-generated-databases 10000000 \
+  --num-queries 1000000 \
+  --num-tries 40 \
+  --max-generated-databases 1000000 \
   --timeout-seconds 86400 \
   sqlite3 --oracle SUBSET3 \
   > logs/sqlite_run.log 2>&1 &
