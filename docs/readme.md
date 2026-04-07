@@ -13,7 +13,7 @@ kill $(cat sqlancer.pid)
 ```
 ## Get process info
 ```
-ps aux | grep sqlancer
+ps aux | grep sqlancer-2.0.0
 ```
 # Mysql
 ## Activate mysql conda
@@ -73,9 +73,9 @@ nohup java \
   -jar target/sqlancer-2.0.0.jar \
   --num-threads 4 \
   --num-queries 1000000 \
-  --num-tries 40 \
+  --num-tries 20 \
   --max-generated-databases 1000000 \
-  --timeout-seconds 86400 \
+  --timeout-seconds 57600 \
   --host 127.0.0.1 --port 3307 \
   mysql --oracle SUBSET3 \
   > logs/mysql_run.log 2>&1 &
@@ -92,7 +92,7 @@ nohup java \
   --num-queries 1000000 \
   --num-tries 1 \
   --max-generated-databases 1000000 \
-  --timeout-seconds 86400 \
+  --timeout-seconds 57600 \
   --host 127.0.0.1 --port 3307 \
   mysql --oracle SUBSET3 \
   > logs/mysql_run.log 2>&1 &

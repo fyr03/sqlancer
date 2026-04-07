@@ -4,6 +4,7 @@ import java.sql.SQLException;
 import java.sql.Statement;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
+import java.math.BigDecimal;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
@@ -78,20 +79,35 @@ public class MySQLSubsetOracle3 implements TestOracle<MySQLGlobalState> {
     private final ExpectedErrors insertErrors;
     private String lastQueryString;
 
+    private enum QueryShape {
+        PLAIN_SELECT,
+        COUNT_STAR,
+        GROUP_BY_COUNT,
+        GROUP_BY_MAX,
+        ORDER_BY_LIMIT_ASC,
+        ORDER_BY_LIMIT_DESC,
+        COUNT_DISTINCT,
+        MULTI_PREDICATE
+    }
+
     private static final class QuerySpec {
         private final String tableName;
+        private final QueryShape shape;
         private final String whereClause;
         private final String selectQuery;
         private final List<MySQLColumn> resultColumns;
         private final MySQLColumn predicateColumn;
+        private final MySQLColumn groupingColumn;
 
-        private QuerySpec(String tableName, String whereClause, String selectQuery, List<MySQLColumn> resultColumns,
-                MySQLColumn predicateColumn) {
+        private QuerySpec(String tableName, QueryShape shape, String whereClause, String selectQuery,
+                List<MySQLColumn> resultColumns, MySQLColumn predicateColumn, MySQLColumn groupingColumn) {
             this.tableName = tableName;
+            this.shape = shape;
             this.whereClause = whereClause;
             this.selectQuery = selectQuery;
             this.resultColumns = resultColumns;
             this.predicateColumn = predicateColumn;
+            this.groupingColumn = groupingColumn;
         }
 
         private String getCountQuery() {
@@ -105,6 +121,14 @@ public class MySQLSubsetOracle3 implements TestOracle<MySQLGlobalState> {
         private String getMinQuery(String col) {
             return "SELECT MIN(`" + col + "`) FROM " + tableName + whereClause;
         }
+
+        private String getGroupedCountQuery() {
+            if (groupingColumn == null) {
+                throw new AssertionError("groupingColumn is null for " + shape);
+            }
+            return "SELECT `" + groupingColumn.getName() + "`, COUNT(*) FROM " + tableName + whereClause
+                    + " GROUP BY `" + groupingColumn.getName() + "`";
+        }
     }
 
     private static final class QuerySnapshot {
@@ -112,14 +136,23 @@ public class MySQLSubsetOracle3 implements TestOracle<MySQLGlobalState> {
         private final Map<String, Integer> rowDigests;
         private final Map<String, Double> maxValues;
         private final Map<String, Double> minValues;
+        private final Map<String, Long> groupedCounts;
+        private final Map<String, Double> groupedMaxValues;
+        private final Long distinctCount;
+        private final Double orderedValue;
         private final List<String> plan;
 
         private QuerySnapshot(Long count, Map<String, Integer> rowDigests, Map<String, Double> maxValues,
-                Map<String, Double> minValues, List<String> plan) {
+                Map<String, Double> minValues, Map<String, Long> groupedCounts,
+                Map<String, Double> groupedMaxValues, Long distinctCount, Double orderedValue, List<String> plan) {
             this.count = count;
             this.rowDigests = rowDigests;
             this.maxValues = maxValues;
             this.minValues = minValues;
+            this.groupedCounts = groupedCounts;
+            this.groupedMaxValues = groupedMaxValues;
+            this.distinctCount = distinctCount;
+            this.orderedValue = orderedValue;
             this.plan = plan;
         }
     }
@@ -245,7 +278,7 @@ public class MySQLSubsetOracle3 implements TestOracle<MySQLGlobalState> {
             log("  Validated baseline queries: " + baselines.size());
             for (int i = 0; i < baselines.size(); i++) {
                 BaselinePhase baseline = baselines.get(i);
-                log("  Baseline[" + (i + 1) + "] count: " + baseline.snapshot.count);
+                log("  Baseline[" + (i + 1) + "] " + summarizeSnapshot(baseline.query, baseline.snapshot));
                 logPlan("Plan1[" + (i + 1) + "]", baseline.snapshot.plan);
             }
 
@@ -285,17 +318,12 @@ public class MySQLSubsetOracle3 implements TestOracle<MySQLGlobalState> {
                 }
                 QuerySnapshot s2Snapshot = executeSnapshot("S2", baseline.query, numericCols, false, s2Plan);
                 try {
-                    log("  S2 count[" + (i + 1) + "]: " + s2Snapshot.count);
+                    log("  S2[" + (i + 1) + "] " + summarizeSnapshot(baseline.query, s2Snapshot));
                     suppressKnownReportedBug(table, baseline.query, baseline.snapshot, s2Snapshot);
 
                 log("\n[Step 6] Checking monotonicity across S1 ⊆ S2...");
                 log("\n[Step 6." + (i + 1) + "] Checking monotonicity across S1/S2...");
-                    verifyCount(baseline.query, baseline.snapshot, s2Snapshot);
-                    for (MySQLColumn col : numericCols) {
-                    verifyMax(baseline.query, col.getName(), baseline.snapshot, s2Snapshot);
-                    verifyMin(baseline.query, col.getName(), baseline.snapshot, s2Snapshot);
-                }
-                    verifySelectSubset(baseline.query, baseline.snapshot, s2Snapshot);
+                    verifyQueryShape(baseline.query, baseline.snapshot, s2Snapshot, numericCols);
                 } catch (IgnoreMeException e) {
                     log("  Baseline[" + (i + 1) + "] skipped: "
                             + (e.getMessage() == null ? "suppressed known bug pattern" : e.getMessage()));
@@ -329,13 +357,13 @@ public class MySQLSubsetOracle3 implements TestOracle<MySQLGlobalState> {
         Map<String, BaselinePhase> phases = new LinkedHashMap<>();
         for (int attempt = 0; attempt < MAX_QUERY_GENERATION_ATTEMPTS && phases.size() < TARGET_BASELINE_QUERIES;
                 attempt++) {
-            QuerySpec candidate = buildQuerySpec(table, skewProfile);
+            QuerySpec candidate = buildQuerySpec(table, numericCols, skewProfile);
             if (phases.containsKey(candidate.selectQuery)) {
                 continue;
             }
             try {
                 QuerySnapshot snapshot = executeSnapshot("S1", candidate, numericCols, true);
-                if (snapshot.count == null || snapshot.count == 0L) {
+                if (!hasUsefulBaselineResult(candidate, snapshot)) {
                     log("  Query candidate #" + (attempt + 1) + " skipped: empty baseline result");
                     continue;
                 }
@@ -351,15 +379,106 @@ public class MySQLSubsetOracle3 implements TestOracle<MySQLGlobalState> {
         return new ArrayList<>(phases.values());
     }
 
-    private QuerySpec buildQuerySpec(MySQLTable table, SkewProfile skewProfile) {
+    private QuerySpec buildQuerySpec(MySQLTable table, List<MySQLColumn> numericCols, SkewProfile skewProfile) {
+        QueryShape shape = chooseQueryShape(table, numericCols);
         String whereClause = buildWhereClause(skewProfile);
-        List<MySQLColumn> projectionColumns = chooseProjectionColumns(table, skewProfile.predicateColumn);
+        MySQLColumn groupingColumn = null;
+        MySQLColumn aggregateColumn = null;
+        List<MySQLColumn> resultColumns = new ArrayList<>();
+        String selectQuery;
+        switch (shape) {
+        case COUNT_STAR:
+            selectQuery = "SELECT COUNT(*) FROM " + table.getName() + whereClause;
+            break;
+        case GROUP_BY_COUNT:
+            groupingColumn = chooseGroupingColumn(table);
+            selectQuery = "SELECT `" + groupingColumn.getName() + "`, COUNT(*) FROM "
+                    + table.getName() + whereClause + " GROUP BY `" + groupingColumn.getName() + "`";
+            break;
+        case GROUP_BY_MAX:
+            groupingColumn = chooseGroupingColumn(table);
+            aggregateColumn = chooseAggregateColumn(numericCols);
+            selectQuery = "SELECT `" + groupingColumn.getName() + "`, MAX(`" + aggregateColumn.getName() + "`) FROM "
+                    + table.getName() + whereClause + " GROUP BY `" + groupingColumn.getName() + "`";
+            break;
+        case ORDER_BY_LIMIT_ASC:
+            aggregateColumn = chooseAggregateColumn(numericCols);
+            whereClause = appendConjunct(whereClause, "`" + aggregateColumn.getName() + "` IS NOT NULL");
+            selectQuery = "SELECT `" + aggregateColumn.getName() + "` FROM " + table.getName()
+                    + whereClause
+                    + " ORDER BY `" + aggregateColumn.getName() + "` ASC LIMIT 1";
+            break;
+        case ORDER_BY_LIMIT_DESC:
+            aggregateColumn = chooseAggregateColumn(numericCols);
+            whereClause = appendConjunct(whereClause, "`" + aggregateColumn.getName() + "` IS NOT NULL");
+            selectQuery = "SELECT `" + aggregateColumn.getName() + "` FROM " + table.getName()
+                    + whereClause
+                    + " ORDER BY `" + aggregateColumn.getName() + "` DESC LIMIT 1";
+            break;
+        case COUNT_DISTINCT:
+            aggregateColumn = chooseDistinctColumn(table);
+            selectQuery = "SELECT COUNT(DISTINCT `" + aggregateColumn.getName() + "`) FROM "
+                    + table.getName() + whereClause;
+            break;
+        case MULTI_PREDICATE:
+            MySQLColumn secondaryPredicateColumn = chooseSecondaryPredicateColumn(table, skewProfile.predicateColumn);
+            whereClause = appendConjunct(whereClause, "`" + secondaryPredicateColumn.getName() + "` IS NOT NULL");
+            resultColumns = chooseProjectionColumns(table, skewProfile.predicateColumn);
+            selectQuery = buildPlainSelectQuery(table, whereClause, resultColumns);
+            break;
+        case PLAIN_SELECT:
+        default:
+            resultColumns = chooseProjectionColumns(table, skewProfile.predicateColumn);
+            selectQuery = buildPlainSelectQuery(table, whereClause, resultColumns);
+            break;
+        }
+        logSQL(selectQuery);
+        return new QuerySpec(table.getName(), shape, whereClause, selectQuery, resultColumns,
+                skewProfile.predicateColumn, groupingColumn);
+    }
+
+    private boolean hasUsefulBaselineResult(QuerySpec query, QuerySnapshot snapshot) {
+        switch (query.shape) {
+        case COUNT_STAR:
+        case PLAIN_SELECT:
+        case MULTI_PREDICATE:
+            return snapshot.count != null && snapshot.count > 0L;
+        case GROUP_BY_COUNT:
+            return snapshot.groupedCounts != null && !snapshot.groupedCounts.isEmpty();
+        case GROUP_BY_MAX:
+            return snapshot.groupedMaxValues != null && !snapshot.groupedMaxValues.isEmpty();
+        case ORDER_BY_LIMIT_ASC:
+        case ORDER_BY_LIMIT_DESC:
+            return snapshot.orderedValue != null;
+        case COUNT_DISTINCT:
+            return snapshot.distinctCount != null && snapshot.distinctCount > 0L;
+        default:
+            throw new AssertionError(query.shape);
+        }
+    }
+
+    private QueryShape chooseQueryShape(MySQLTable table, List<MySQLColumn> numericCols) {
+        List<QueryShape> shapes = new ArrayList<>();
+        shapes.add(QueryShape.PLAIN_SELECT);
+        shapes.add(QueryShape.COUNT_STAR);
+        shapes.add(QueryShape.GROUP_BY_COUNT);
+        shapes.add(QueryShape.COUNT_DISTINCT);
+        if (!numericCols.isEmpty()) {
+            shapes.add(QueryShape.GROUP_BY_MAX);
+            shapes.add(QueryShape.ORDER_BY_LIMIT_ASC);
+            shapes.add(QueryShape.ORDER_BY_LIMIT_DESC);
+        }
+        if (table.getColumns().size() > 1) {
+            shapes.add(QueryShape.MULTI_PREDICATE);
+        }
+        return Randomly.fromList(shapes);
+    }
+
+    private String buildPlainSelectQuery(MySQLTable table, String whereClause, List<MySQLColumn> projectionColumns) {
         String selectColumns = projectionColumns.stream()
                 .map(c -> "`" + c.getName() + "`")
                 .collect(Collectors.joining(", "));
-        String selectQuery = "SELECT " + selectColumns + " FROM " + table.getName() + whereClause;
-        logSQL(selectQuery);
-        return new QuerySpec(table.getName(), whereClause, selectQuery, projectionColumns, skewProfile.predicateColumn);
+        return "SELECT " + selectColumns + " FROM " + table.getName() + whereClause;
     }
 
     private String buildWhereClause(SkewProfile skewProfile) {
@@ -469,6 +588,50 @@ public class MySQLSubsetOracle3 implements TestOracle<MySQLGlobalState> {
         return new ArrayList<>(chosen);
     }
 
+    private MySQLColumn chooseGroupingColumn(MySQLTable table) {
+        List<MySQLColumn> nonPrimaryCols = table.getColumns().stream()
+                .filter(c -> !c.isPrimaryKey())
+                .filter(c -> c.getType() != sqlancer.mysql.MySQLSchema.MySQLDataType.FLOAT)
+                .filter(c -> c.getType() != sqlancer.mysql.MySQLSchema.MySQLDataType.DOUBLE)
+                .collect(Collectors.toList());
+        if (!nonPrimaryCols.isEmpty()) {
+            return Randomly.fromList(nonPrimaryCols);
+        }
+        List<MySQLColumn> safeFallback = table.getColumns().stream()
+                .filter(c -> c.getType() != sqlancer.mysql.MySQLSchema.MySQLDataType.FLOAT)
+                .filter(c -> c.getType() != sqlancer.mysql.MySQLSchema.MySQLDataType.DOUBLE)
+                .collect(Collectors.toList());
+        if (!safeFallback.isEmpty()) {
+            return Randomly.fromList(safeFallback);
+        }
+        throw new IgnoreMeException();
+    }
+
+    private MySQLColumn chooseAggregateColumn(List<MySQLColumn> numericCols) {
+        if (numericCols.isEmpty()) {
+            throw new IgnoreMeException();
+        }
+        return Randomly.fromList(numericCols);
+    }
+
+    private MySQLColumn chooseDistinctColumn(MySQLTable table) {
+        return Randomly.fromList(table.getColumns());
+    }
+
+    private MySQLColumn chooseSecondaryPredicateColumn(MySQLTable table, MySQLColumn predicateColumn) {
+        List<MySQLColumn> otherColumns = table.getColumns().stream()
+                .filter(c -> !c.equals(predicateColumn))
+                .collect(Collectors.toList());
+        if (otherColumns.isEmpty()) {
+            throw new IgnoreMeException();
+        }
+        return Randomly.fromList(otherColumns);
+    }
+
+    private String appendConjunct(String whereClause, String predicate) {
+        return whereClause + " AND " + predicate;
+    }
+
     private String unquoteLiteral(String literal) {
         if (literal == null || literal.length() < 2) {
             return literal == null ? "" : literal;
@@ -487,20 +650,51 @@ public class MySQLSubsetOracle3 implements TestOracle<MySQLGlobalState> {
 
     private QuerySnapshot executeSnapshot(String label, QuerySpec query, List<MySQLColumn> numericCols,
             boolean captureRows, List<String> precomputedPlan) throws Exception {
-        Long count = executeSingleLong(query.getCountQuery());
-        Map<String, Integer> rowDigests = captureRows ? executeAndGetRowDigests(query.selectQuery, query.resultColumns)
-                : null;
         Map<String, Double> maxValues = new LinkedHashMap<>();
         Map<String, Double> minValues = new LinkedHashMap<>();
-        for (MySQLColumn col : numericCols) {
-            maxValues.put(col.getName(), executeSingleDouble(query.getMaxQuery(col.getName())));
-            minValues.put(col.getName(), executeSingleDouble(query.getMinQuery(col.getName())));
+        Map<String, Long> groupedCounts = new LinkedHashMap<>();
+        Map<String, Double> groupedMaxValues = new LinkedHashMap<>();
+        Long count = null;
+        Map<String, Integer> rowDigests = null;
+        Long distinctCount = null;
+        Double orderedValue = null;
+
+        switch (query.shape) {
+        case PLAIN_SELECT:
+        case MULTI_PREDICATE:
+            count = executeSingleLong(query.getCountQuery());
+            rowDigests = captureRows ? executeAndGetRowDigests(query.selectQuery, query.resultColumns) : null;
+            for (MySQLColumn col : numericCols) {
+                maxValues.put(col.getName(), executeSingleDouble(query.getMaxQuery(col.getName())));
+                minValues.put(col.getName(), executeSingleDouble(query.getMinQuery(col.getName())));
+            }
+            break;
+        case COUNT_STAR:
+            count = executeSingleLong(query.selectQuery);
+            break;
+        case GROUP_BY_COUNT:
+            groupedCounts = executeGroupedLongMap(query.selectQuery, query.groupingColumn);
+            break;
+        case GROUP_BY_MAX:
+            groupedMaxValues = executeGroupedDoubleMap(query.selectQuery, query.groupingColumn);
+            groupedCounts = executeGroupedLongMap(query.getGroupedCountQuery(), query.groupingColumn);
+            break;
+        case ORDER_BY_LIMIT_ASC:
+        case ORDER_BY_LIMIT_DESC:
+            orderedValue = executeSingleDouble(query.selectQuery);
+            break;
+        case COUNT_DISTINCT:
+            distinctCount = executeSingleLong(query.selectQuery);
+            break;
+        default:
+            throw new AssertionError(query.shape);
         }
         List<String> plan = precomputedPlan != null ? precomputedPlan : captureExplainPlan(query.selectQuery);
         if (rowDigests != null) {
             log("  " + label + " result rows: " + totalDigestCount(rowDigests));
         }
-        return new QuerySnapshot(count, rowDigests, maxValues, minValues, plan);
+        return new QuerySnapshot(count, rowDigests, maxValues, minValues, groupedCounts, groupedMaxValues,
+                distinctCount, orderedValue, plan);
     }
 
     private void suppressKnownReportedBug(MySQLTable table, QuerySpec query, QuerySnapshot s1, QuerySnapshot s2)
@@ -508,22 +702,22 @@ public class MySQLSubsetOracle3 implements TestOracle<MySQLGlobalState> {
         if (!SUPPRESS_KNOWN_FLOAT_ZERO_MAX_NULL_BUG) {
             return;
         }
-        String floatingPredicateDescription = extractFloatingPredicateDescription(query);
-        if (floatingPredicateDescription == null) {
+        String numericPredicateDescription = extractNumericPredicateDescription(query);
+        if (numericPredicateDescription == null) {
             return;
         }
-        String affectedColumn = findKnownFloatMaxNullBugColumn(table, query, s1, s2);
+        String affectedColumn = findKnownNumericMaxNullBugColumn(table, query, s1, s2);
         if (affectedColumn == null) {
             return;
         }
-        log("  Known reported MySQL bug pattern detected (FLOAT/DOUBLE range/equality index path leaks NULL MAX).");
-        log("  Floating predicate: " + floatingPredicateDescription + ", affected column: " + affectedColumn);
+        log("  Known reported MySQL bug pattern detected (numeric range/equality index path leaks NULL MAX).");
+        log("  Numeric predicate: " + numericPredicateDescription + ", affected column: " + affectedColumn);
         log("  Suppressing this round so Oracle3 can continue searching for new bugs.");
         throw new IgnoreMeException();
     }
 
-    private String extractFloatingPredicateDescription(QuerySpec query) {
-        if (query.predicateColumn == null || !isFloatingPointColumn(query.predicateColumn)) {
+    private String extractNumericPredicateDescription(QuerySpec query) {
+        if (query.predicateColumn == null || !query.predicateColumn.getType().isNumeric()) {
             return null;
         }
         String prefix = " WHERE `" + query.predicateColumn.getName() + "` ";
@@ -541,15 +735,18 @@ public class MySQLSubsetOracle3 implements TestOracle<MySQLGlobalState> {
         return null;
     }
 
-    private String findKnownFloatMaxNullBugColumn(MySQLTable table, QuerySpec query, QuerySnapshot s1, QuerySnapshot s2)
+    private String findKnownNumericMaxNullBugColumn(MySQLTable table, QuerySpec query, QuerySnapshot s1, QuerySnapshot s2)
             throws SQLException {
+        if (query.shape == QueryShape.GROUP_BY_MAX) {
+            return findKnownNumericGroupedMaxNullBugColumn(table, query, s1, s2);
+        }
         if (s1.count == null || s1.count <= 0 || s2.count == null || s2.count <= 0) {
             return null;
         }
         MySQLTable currentTable = findTable(query.tableName);
         MySQLTable tableWithFreshIndexes = currentTable != null ? currentTable : table;
         for (MySQLColumn col : tableWithFreshIndexes.getColumns()) {
-            if (!isFloatingPointColumn(col)) {
+            if (!col.getType().isNumeric()) {
                 continue;
             }
             Double s1Max = s1.maxValues.get(col.getName());
@@ -566,6 +763,43 @@ public class MySQLSubsetOracle3 implements TestOracle<MySQLGlobalState> {
         return null;
     }
 
+    private String findKnownNumericGroupedMaxNullBugColumn(MySQLTable table, QuerySpec query, QuerySnapshot s1,
+            QuerySnapshot s2) throws SQLException {
+        if (query.groupingColumn == null || s1.groupedMaxValues == null || s1.groupedMaxValues.isEmpty()
+                || s2.groupedMaxValues == null) {
+            return null;
+        }
+
+        String aggregateColumn = extractGroupedMaxAggregateColumn(query);
+        if (aggregateColumn == null) {
+            return null;
+        }
+
+        MySQLTable currentTable = findTable(query.tableName);
+        MySQLTable tableWithFreshIndexes = currentTable != null ? currentTable : table;
+        MySQLColumn aggregateColumnRef = tableWithFreshIndexes.getColumns().stream()
+                .filter(c -> c.getName().equalsIgnoreCase(aggregateColumn))
+                .findFirst()
+                .orElse(null);
+        if (aggregateColumnRef == null || !aggregateColumnRef.getType().isNumeric()) {
+            return null;
+        }
+
+        for (Map.Entry<String, Double> entry : s1.groupedMaxValues.entrySet()) {
+            Double s1Value = entry.getValue();
+            Double s2Value = s2.groupedMaxValues.get(entry.getKey());
+            if (s1Value == null || s2Value != null) {
+                continue;
+            }
+            Double ignoreIndexValue = executeSingleDouble(buildIgnoreIndexGroupedAggregateQuery(
+                    tableWithFreshIndexes, query, aggregateColumn, entry.getKey()));
+            if (ignoreIndexValue != null && ignoreIndexValue + 1e-9 >= s1Value) {
+                return aggregateColumn;
+            }
+        }
+        return null;
+    }
+
     private String buildIgnoreIndexAggregateQuery(MySQLTable table, QuerySpec query, String aggregate, String column) {
         String ignoreIndexClause = fetchCurrentIndexNames(query.tableName).stream()
                 .collect(Collectors.joining(", "));
@@ -574,6 +808,50 @@ public class MySQLSubsetOracle3 implements TestOracle<MySQLGlobalState> {
         }
         return "SELECT " + aggregate + "(`" + column + "`) FROM " + query.tableName
                 + " IGNORE INDEX (" + ignoreIndexClause + ")" + query.whereClause;
+    }
+
+    // private String buildIgnoreIndexSelectQuery(String selectQuery, String tableName) {
+    //     String ignoreIndexClause = fetchCurrentIndexNames(tableName).stream()
+    //             .collect(Collectors.joining(", "));
+    //     if (ignoreIndexClause.isEmpty()) {
+    //         return selectQuery;
+    //     }
+    //     String fromNeedle = " FROM " + tableName;
+    //     String replacement = fromNeedle + " IGNORE INDEX (" + ignoreIndexClause + ")";
+    //     return selectQuery.replaceFirst(java.util.regex.Pattern.quote(fromNeedle),
+    //             java.util.regex.Matcher.quoteReplacement(replacement));
+    // }
+
+    private String buildIgnoreIndexGroupedAggregateQuery(MySQLTable table, QuerySpec query, String aggregateColumn,
+            String groupKey) {
+        String ignoreIndexClause = fetchCurrentIndexNames(query.tableName).stream()
+                .collect(Collectors.joining(", "));
+        StringBuilder sb = new StringBuilder();
+        sb.append("SELECT MAX(`").append(aggregateColumn).append("`) FROM ").append(query.tableName);
+        if (!ignoreIndexClause.isEmpty()) {
+            sb.append(" IGNORE INDEX (").append(ignoreIndexClause).append(")");
+        }
+        sb.append(query.whereClause);
+        sb.append(" AND `").append(query.groupingColumn.getName()).append("` <=> ")
+                .append(toGroupKeyLiteral(groupKey, query.groupingColumn));
+        return sb.toString();
+    }
+
+    private String extractGroupedMaxAggregateColumn(QuerySpec query) {
+        if (query.shape != QueryShape.GROUP_BY_MAX) {
+            return null;
+        }
+        String marker = "MAX(`";
+        int start = query.selectQuery.indexOf(marker);
+        if (start < 0) {
+            return null;
+        }
+        start += marker.length();
+        int end = query.selectQuery.indexOf("`)", start);
+        if (end < 0) {
+            return null;
+        }
+        return query.selectQuery.substring(start, end);
     }
 
 
@@ -613,6 +891,23 @@ public class MySQLSubsetOracle3 implements TestOracle<MySQLGlobalState> {
                     "Oracle3 COUNT violation: COUNT(S1)=%d > COUNT(S2)=%d%n"
                     + "  Query: %s%n  Plan1: %s%n  Plan2: %s",
                     s1.count, s2.count, query.selectQuery, formatPlan(s1.plan), formatPlan(s2.plan)));
+        }
+    }
+
+    private void verifyCountDistinct(QuerySpec query, QuerySnapshot s1, QuerySnapshot s2) {
+        if (s1.distinctCount == null || s2.distinctCount == null) {
+            log("  COUNT(DISTINCT) skipped because one result was null");
+            return;
+        }
+        boolean pass = s1.distinctCount <= s2.distinctCount;
+        log(String.format("  COUNT(DISTINCT) S1=%-6s <= S2=%-6s   [%s]",
+                s1.distinctCount, s2.distinctCount, pass ? "PASS" : "FAIL"));
+        if (!pass) {
+            lastQueryString = query.selectQuery;
+            throw new AssertionError(String.format(
+                    "Oracle3 COUNT DISTINCT violation: S1=%d > S2=%d%n"
+                    + "  Query: %s%n  Plan1: %s%n  Plan2: %s",
+                    s1.distinctCount, s2.distinctCount, query.selectQuery, formatPlan(s1.plan), formatPlan(s2.plan)));
         }
     }
 
@@ -665,6 +960,136 @@ public class MySQLSubsetOracle3 implements TestOracle<MySQLGlobalState> {
                     "Oracle3 row-set subset violation: Res1 is not a subset of Res2%n"
                     + "  Missing row digests: %s%n  Query: %s%n  Plan1: %s%n  Plan2: %s",
                     missing, query.selectQuery, formatPlan(s1.plan), formatPlan(s2.plan)));
+        }
+    }
+
+    private void verifyGroupedCount(QuerySpec query, QuerySnapshot s1, QuerySnapshot s2) {
+        for (Map.Entry<String, Long> entry : s1.groupedCounts.entrySet()) {
+            String groupKey = entry.getKey();
+            Long s1Count = entry.getValue();
+            Long s2Count = s2.groupedCounts.get(groupKey);
+            boolean pass = s2Count != null && s1Count <= s2Count;
+            log(String.format("  GROUP COUNT key=%s S1=%-6s <= S2=%-6s   [%s]",
+                    groupKey, s1Count, s2Count, pass ? "PASS" : "FAIL"));
+            if (!pass) {
+                lastQueryString = query.selectQuery;
+                throw new AssertionError(String.format(
+                        "Oracle3 GROUP BY COUNT violation for key %s: S1=%s > S2=%s%n"
+                        + "  Query: %s%n  Plan1: %s%n  Plan2: %s",
+                        groupKey, s1Count, s2Count, query.selectQuery, formatPlan(s1.plan), formatPlan(s2.plan)));
+            }
+        }
+    }
+
+    private void verifyGroupedMax(QuerySpec query, QuerySnapshot s1, QuerySnapshot s2) {
+        for (Map.Entry<String, Double> entry : s1.groupedMaxValues.entrySet()) {
+            String groupKey = entry.getKey();
+            Double s1Value = entry.getValue();
+            Double s2Value = s2.groupedMaxValues.get(groupKey);
+            if (s1Value == null) {
+                log(String.format("  GROUP MAX key=%s skipped because S1 is NULL", groupKey));
+                continue;
+            }
+            boolean pass = s2Value != null && s1Value <= s2Value + 1e-9;
+            log(String.format("  GROUP MAX key=%s S1=%-12s <= S2=%-12s   [%s]",
+                    groupKey, s1Value, s2Value, pass ? "PASS" : "FAIL"));
+            if (!pass) {
+                lastQueryString = query.selectQuery;
+                throw new AssertionError(String.format(
+                        "Oracle3 GROUP BY MAX violation for key %s: S1=%s > S2=%s%n"
+                        + "  Query: %s%n  Plan1: %s%n  Plan2: %s",
+                        groupKey, s1Value, s2Value, query.selectQuery, formatPlan(s1.plan), formatPlan(s2.plan)));
+            }
+        }
+    }
+
+    private void verifyOrderByLimitAsc(QuerySpec query, QuerySnapshot s1, QuerySnapshot s2) {
+        if (s1.orderedValue == null || s2.orderedValue == null) {
+            log("  ORDER BY ASC LIMIT 1 skipped because one result was null");
+            return;
+        }
+        boolean pass = s2.orderedValue <= s1.orderedValue + 1e-9;
+        log(String.format("  ORDER MIN  S1=%-12s >= S2=%-12s   [%s]",
+                s1.orderedValue, s2.orderedValue, pass ? "PASS" : "FAIL"));
+        if (!pass) {
+            lastQueryString = query.selectQuery;
+            throw new AssertionError(String.format(
+                    "Oracle3 ORDER BY ASC LIMIT 1 violation: S1=%s < S2=%s%n"
+                    + "  Query: %s%n  Plan1: %s%n  Plan2: %s",
+                    s1.orderedValue, s2.orderedValue, query.selectQuery, formatPlan(s1.plan), formatPlan(s2.plan)));
+        }
+    }
+
+    private void verifyOrderByLimitDesc(QuerySpec query, QuerySnapshot s1, QuerySnapshot s2) {
+        if (s1.orderedValue == null || s2.orderedValue == null) {
+            log("  ORDER BY DESC LIMIT 1 skipped because one result was null");
+            return;
+        }
+        boolean pass = s1.orderedValue <= s2.orderedValue + 1e-9;
+        log(String.format("  ORDER MAX  S1=%-12s <= S2=%-12s   [%s]",
+                s1.orderedValue, s2.orderedValue, pass ? "PASS" : "FAIL"));
+        if (!pass) {
+            lastQueryString = query.selectQuery;
+            throw new AssertionError(String.format(
+                    "Oracle3 ORDER BY DESC LIMIT 1 violation: S1=%s > S2=%s%n"
+                    + "  Query: %s%n  Plan1: %s%n  Plan2: %s",
+                    s1.orderedValue, s2.orderedValue, query.selectQuery, formatPlan(s1.plan), formatPlan(s2.plan)));
+        }
+    }
+
+    private void verifyQueryShape(QuerySpec query, QuerySnapshot s1, QuerySnapshot s2, List<MySQLColumn> numericCols)
+            throws SQLException {
+        switch (query.shape) {
+        case PLAIN_SELECT:
+        case MULTI_PREDICATE:
+            verifyCount(query, s1, s2);
+            for (MySQLColumn col : numericCols) {
+                verifyMax(query, col.getName(), s1, s2);
+                verifyMin(query, col.getName(), s1, s2);
+            }
+            verifySelectSubset(query, s1, s2);
+            break;
+        case COUNT_STAR:
+            verifyCount(query, s1, s2);
+            break;
+        case GROUP_BY_COUNT:
+            verifyGroupedCount(query, s1, s2);
+            break;
+        case GROUP_BY_MAX:
+            verifyGroupedCount(query, s1, s2);
+            verifyGroupedMax(query, s1, s2);
+            break;
+        case ORDER_BY_LIMIT_ASC:
+            verifyOrderByLimitAsc(query, s1, s2);
+            break;
+        case ORDER_BY_LIMIT_DESC:
+            verifyOrderByLimitDesc(query, s1, s2);
+            break;
+        case COUNT_DISTINCT:
+            verifyCountDistinct(query, s1, s2);
+            break;
+        default:
+            throw new AssertionError(query.shape);
+        }
+    }
+
+    private String summarizeSnapshot(QuerySpec query, QuerySnapshot snapshot) {
+        switch (query.shape) {
+        case PLAIN_SELECT:
+        case MULTI_PREDICATE:
+        case COUNT_STAR:
+            return "shape=" + query.shape + ", count=" + snapshot.count;
+        case GROUP_BY_COUNT:
+            return "shape=" + query.shape + ", groups=" + snapshot.groupedCounts.size();
+        case GROUP_BY_MAX:
+            return "shape=" + query.shape + ", groups=" + snapshot.groupedMaxValues.size();
+        case ORDER_BY_LIMIT_ASC:
+        case ORDER_BY_LIMIT_DESC:
+            return "shape=" + query.shape + ", value=" + snapshot.orderedValue;
+        case COUNT_DISTINCT:
+            return "shape=" + query.shape + ", distinct=" + snapshot.distinctCount;
+        default:
+            return "shape=" + query.shape;
         }
     }
 
@@ -1216,6 +1641,55 @@ public class MySQLSubsetOracle3 implements TestOracle<MySQLGlobalState> {
         return null;
     }
 
+    private Map<String, Long> executeGroupedLongMap(String query, MySQLColumn groupColumn) throws SQLException {
+        Map<String, Long> groupedValues = new LinkedHashMap<>();
+        ExpectedErrors errors = new ExpectedErrors();
+        MySQLErrors.addExpressionErrors(errors);
+        state.getState().logStatement(query);
+        SQLancerResultSet rs = new SQLQueryAdapter(query, errors).executeAndGet(state);
+        if (rs == null) {
+            throw new SQLException("Query failed (null ResultSet): " + query);
+        }
+        try {
+            while (rs.next()) {
+                groupedValues.put(normalizeGroupKey(rs.getString(1), groupColumn), rs.getLong(2));
+            }
+        } finally {
+            rs.close();
+        }
+        return groupedValues;
+    }
+
+    private Map<String, Double> executeGroupedDoubleMap(String query, MySQLColumn groupColumn) throws SQLException {
+        Map<String, Double> groupedValues = new LinkedHashMap<>();
+        ExpectedErrors errors = new ExpectedErrors();
+        MySQLErrors.addExpressionErrors(errors);
+        state.getState().logStatement(query);
+        SQLancerResultSet rs = new SQLQueryAdapter(query, errors).executeAndGet(state);
+        if (rs == null) {
+            throw new SQLException("Query failed (null ResultSet): " + query);
+        }
+        try {
+            while (rs.next()) {
+                String rawValue = rs.getString(2);
+                Double parsedValue;
+                if (rawValue == null) {
+                    parsedValue = null;
+                } else {
+                    try {
+                        parsedValue = Double.parseDouble(rawValue);
+                    } catch (NumberFormatException e) {
+                        throw new IgnoreMeException();
+                    }
+                }
+                groupedValues.put(normalizeGroupKey(rs.getString(1), groupColumn), parsedValue);
+            }
+        } finally {
+            rs.close();
+        }
+        return groupedValues;
+    }
+
     private Map<String, Integer> executeAndGetRowDigests(String query, List<MySQLColumn> columns)
             throws SQLException {
         Map<String, Integer> rowDigests = new LinkedHashMap<>();
@@ -1271,6 +1745,41 @@ public class MySQLSubsetOracle3 implements TestOracle<MySQLGlobalState> {
             return 0;
         }
         return digests.values().stream().mapToInt(Integer::intValue).sum();
+    }
+
+    private String normalizeGroupKey(String rawValue, MySQLColumn groupColumn) {
+        if (rawValue == null) {
+            return "NULL";
+        }
+        String normalized = rawValue.stripTrailing();
+        if (groupColumn.getType() == sqlancer.mysql.MySQLSchema.MySQLDataType.DECIMAL) {
+            try {
+                return new BigDecimal(normalized).stripTrailingZeros().toPlainString();
+            } catch (NumberFormatException ignored) {
+                return normalized;
+            }
+        }
+        if (isFloatingPointColumn(groupColumn)) {
+            normalized = normalizeNumericValue(normalized);
+        }
+        return normalized;
+    }
+
+    private String toGroupKeyLiteral(String groupKey, MySQLColumn groupColumn) {
+        if (groupKey == null || "NULL".equals(groupKey)) {
+            return "NULL";
+        }
+        switch (groupColumn.getType()) {
+        case VARCHAR:
+            return quoteStringLiteral(groupKey);
+        case INT:
+        case DECIMAL:
+        case FLOAT:
+        case DOUBLE:
+            return groupKey;
+        default:
+            throw new AssertionError(groupColumn.getType());
+        }
     }
 
     private String computeCurrentRowDigest(SQLancerResultSet rs, List<MySQLColumn> columns) throws SQLException {
